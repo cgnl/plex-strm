@@ -8,10 +8,51 @@ Supports both **SQLite** and **PostgreSQL** ([plex-postgresql](https://github.co
 
 1. Finds all `.strm` file references in `media_parts`
 2. Reads each `.strm` file to get the streaming URL inside
-3. Updates `media_parts.file` with the direct HTTP URL
-4. Runs FFprobe on each URL to extract codec, resolution, bitrate, etc.
-5. Creates `media_streams` entries (video + audio) so Plex shows correct info and enables Direct Play
-6. Installs SQLite/PostgreSQL triggers that prevent Plex from reverting the URLs during library scans
+3. Optionally rewrites the base URL (e.g. `localhost` → your public domain)
+4. Updates `media_parts.file` with the direct HTTP URL
+5. Runs FFprobe on each URL to extract codec, resolution, bitrate, etc.
+6. Creates `media_streams` entries (video + audio) so Plex shows correct info and enables Direct Play
+7. Installs SQLite/PostgreSQL triggers that prevent Plex from reverting the URLs during library scans
+
+## Using with Zurg
+
+[Zurg](https://github.com/debridmediamanager/zurg-testing) can generate `.strm` files with `save_strm_files: true` in its config. These files contain URLs like `http://localhost:9091/strm/<id>` that redirect to Real-Debrid download links.
+
+**The problem:** Plex doesn't proxy HTTP URLs — it sends a 302 redirect to the client. If the URL contains `localhost`, remote clients can't reach it.
+
+**The solution:** Use `--base-url` to rewrite URLs to a publicly reachable address:
+
+```yaml
+# zurg config.yml
+save_strm_files: true
+```
+
+```bash
+# Point a Plex library at zurg's strm/ directory, then:
+plex-strm update --pg --protect \
+  --library "STRM Movies" \
+  --base-url https://plex.example.com
+```
+
+This rewrites `http://localhost:9091/strm/ABC123` → `https://plex.example.com/strm/ABC123`.
+
+### Reverse proxy setup
+
+Route `/strm/*` to Zurg in your reverse proxy (Caddy, nginx, etc.):
+
+```
+# Caddyfile example
+plex.example.com {
+    handle /strm/* {
+        reverse_proxy localhost:9091
+    }
+    handle {
+        reverse_proxy localhost:32400
+    }
+}
+```
+
+This way both Plex and Zurg share the same domain. Clients requesting `/strm/*` hit Zurg directly, everything else goes to Plex.
 
 ## Install
 
@@ -31,8 +72,10 @@ plex-strm update --db /path/to/com.plexapp.plugins.library.db --protect
 export PLEX_PG_HOST=localhost PLEX_PG_DATABASE=plex PLEX_PG_USER=plex PLEX_PG_PASSWORD=plex
 plex-strm update --pg --protect
 
-# Limit to specific libraries
-plex-strm update --pg --protect --library "STRM Movies" --library "STRM TV Shows"
+# Limit to specific libraries + rewrite URLs
+plex-strm update --pg --protect \
+  --library "STRM Movies" --library "STRM TV Shows" \
+  --base-url https://plex.example.com
 
 # With subtitles
 export OPENSUB_API_KEY=... OPENSUB_USER=... OPENSUB_PASS=...
@@ -62,6 +105,7 @@ plex-strm update --pg --protect --subtitles
 
 | Flag | Description |
 |------|-------------|
+| `--base-url URL` | Rewrite STRM base URL for remote access (or env `STRM_BASE_URL`) |
 | `--protect` | Install trigger protection during update |
 | `--subtitles` | Download subtitles via OpenSubtitles API |
 | `--ffprobe PATH` | Path to ffprobe binary (default: `ffprobe`) |
@@ -101,6 +145,12 @@ plex-strm update --pg --protect --subtitles
 | `SUBTITLE_LANGS` | Comma-separated language codes (default: nl,en) |
 | `SUBTITLE_DIR` | Directory for downloaded .srt files (default: ./subtitles) |
 
+### URL rewriting
+
+| Variable | Description |
+|----------|-------------|
+| `STRM_BASE_URL` | Rewrite base URL (alternative to `--base-url` flag) |
+
 ## Docker
 
 ```bash
@@ -135,5 +185,7 @@ export PLEX_PG_USER=plex
 export PLEX_PG_PASSWORD=plex
 export PLEX_PG_SCHEMA=plex
 
-python3 /path/to/plex_strm.py --pg --library "My STRM Library" update --protect
+python3 /path/to/plex_strm.py --pg \
+  --library "My STRM Library" \
+  update --protect --base-url https://plex.example.com
 ```

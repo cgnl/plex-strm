@@ -1062,6 +1062,14 @@ def cmd_update(args):
                 log.debug("Not a URL in %s: %s", strm_path, direct_url[:80])
                 continue
 
+            # Rewrite base URL if configured
+            base_url = getattr(args, 'base_url', None) or os.environ.get("STRM_BASE_URL")
+            if base_url:
+                from urllib.parse import urlparse
+                old = urlparse(direct_url)
+                new = urlparse(base_url)
+                direct_url = direct_url.replace(f"{old.scheme}://{old.netloc}", f"{new.scheme}://{new.netloc}", 1)
+
             if db.is_pg:
                 db.execute(cur, "UPDATE media_parts SET file = %s WHERE id = %s",
                            (direct_url, row["id"]))
@@ -1135,7 +1143,7 @@ def cmd_update(args):
                         failed += 1
 
                     total = analyzed + failed
-                    if total % 100 == 0:
+                    if total % 10 == 0:
                         db.commit()
                     if total % 20 == 0:
                         elapsed = time.time() - t0
@@ -1154,11 +1162,17 @@ def cmd_update(args):
             db.commit()
 
     except Exception as e:
-        db.rollback()
+        try:
+            db.rollback()
+        except Exception:
+            pass
         log.error("Update failed: %s", e)
         raise
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1241,6 +1255,8 @@ def main():
 
     # update
     p_update = sub.add_parser("update", help="inject URLs from .strm files + FFprobe analysis")
+    p_update.add_argument("--base-url", metavar="URL",
+                          help="rewrite STRM base URL (e.g. http://localhost:9091 -> https://plex.example.com)")
     p_update.add_argument("--protect", action="store_true",
                           help="install 4-layer trigger protection")
     p_update.add_argument("--subtitles", action="store_true",
