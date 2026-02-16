@@ -639,15 +639,13 @@ def update_media_item(db, media_item_id, meta):
         profile_meta["video_profile"] = video_profile
     if audio_profile:
         profile_meta["audio_profile"] = audio_profile
-    if "height" in meta:
-        profile_meta["height"] = meta["height"]
-    if "width" in meta:
-        profile_meta["width"] = meta["width"]
     extra_data = _build_extra_data(profile_meta)
     if extra_data:
         meta["extra_data"] = extra_data
 
     # Build dynamic UPDATE
+    # width/height are stored in media_items (not media_streams), but must NOT
+    # also appear in extra_data to avoid duplicate XML attributes in Plex output.
     updatable = {k: v for k, v in meta.items()
                  if k in ("duration", "size", "bitrate", "container", "width", "height",
                           "frames_per_second", "display_aspect_ratio", "video_codec",
@@ -1085,6 +1083,24 @@ def cmd_update(args):
         if args.protect and url_mapping:
             _backup_existing_urls(db)
             db.commit()
+
+        # Also find existing HTTP URLs missing media_streams (e.g. from a previous crashed run)
+        cur = db.cursor()
+        ph = "%s" if db.is_pg else "?"
+        join, lib_where, lib_params = _library_join(db, lib_ids, "mp")
+        db.execute(cur,
+            f"SELECT mp.media_item_id, mp.file FROM media_parts mp"
+            f"{join}"
+            f" WHERE mp.file LIKE {ph}{lib_where}"
+            f" AND mp.media_item_id NOT IN ("
+            f"   SELECT DISTINCT media_item_id FROM media_streams"
+            f" )",
+            ("http%",) + lib_params if lib_params else ("http%",))
+        missing = {r["media_item_id"]: r["file"] for r in db.fetchall(cur)}
+        cur.close()
+        if missing:
+            log.info("Found %d HTTP URLs missing media_streams, adding to FFprobe queue", len(missing))
+            url_mapping.update(missing)
 
         # FFprobe analysis
         if url_mapping:
