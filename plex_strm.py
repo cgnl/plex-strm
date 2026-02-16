@@ -63,9 +63,9 @@ class PlexDB:
         self.conn.rollback()
 
     def ph(self, *indices):
-        """Return placeholders. ph(1,2,3) -> '?, ?, ?' or '$1, $2, $3'."""
+        """Return placeholders. ph(1,2,3) -> '%s, %s, %s' or '?, ?, ?'."""
         if self.is_pg:
-            return ", ".join(f"${i}" for i in indices)
+            return ", ".join("%s" for _ in indices)
         return ", ".join("?" for _ in indices)
 
     def q(self, name):
@@ -98,6 +98,43 @@ class PlexDB:
             return dict(zip(cols, row))
         row = cur.fetchone()
         return dict(row) if row else None
+
+
+def _resolve_library_ids(db, names):
+    """Resolve library section names to IDs. Returns list of ints or None if no filter."""
+    if not names:
+        return None
+    cur = db.cursor()
+    ids = []
+    for name in names:
+        ph = "%s" if db.is_pg else "?"
+        db.execute(cur, f"SELECT id FROM library_sections WHERE TRIM(name) = {ph}", (name.strip(),))
+        row = db.fetchone(cur)
+        if row:
+            ids.append(row["id"])
+        else:
+            log.warning("Library '%s' not found, skipping", name)
+    cur.close()
+    if not ids:
+        sys.exit("None of the specified libraries were found")
+    return ids
+
+
+def _library_join(db, lib_ids, alias="mp"):
+    """Return (JOIN clause, WHERE clause, params) for filtering by library section IDs."""
+    if lib_ids is None:
+        return "", "", []
+    # media_parts.media_item_id -> media_items.id
+    # media_items.metadata_item_id -> metadata_items.id
+    # metadata_items.library_section_id -> library_sections.id
+    join = (f" JOIN media_items mi_j ON {alias}.media_item_id = mi_j.id"
+            f" JOIN metadata_items md_j ON mi_j.metadata_item_id = md_j.id")
+    if db.is_pg:
+        placeholders = ", ".join("%s" for _ in lib_ids)
+    else:
+        placeholders = ", ".join("?" for _ in lib_ids)
+    where = f" AND md_j.library_section_id IN ({placeholders})"
+    return join, where, tuple(lib_ids)
 
 
 def connect_from_args(args):
@@ -382,7 +419,7 @@ def _backup_existing_urls(db):
         if db.is_pg:
             db.execute(cur,
                 "INSERT INTO stream_url_backup (part_id, backup_url, backup_time, url_length, url_hash) "
-                "VALUES ($1, $2, NOW(), $3, $4) ON CONFLICT (part_id) DO UPDATE SET "
+                "VALUES (%s, %s, NOW(), %s, %s) ON CONFLICT (part_id) DO UPDATE SET "
                 "backup_url = EXCLUDED.backup_url, backup_time = EXCLUDED.backup_time, "
                 "url_length = EXCLUDED.url_length, url_hash = EXCLUDED.url_hash",
                 (row["id"], row["file"], len(row["file"]), row["file"][:100]))
@@ -404,6 +441,7 @@ def cmd_status(args):
     """Show protection status and URL counts."""
     db = connect_from_args(args)
     try:
+        lib_ids = _resolve_library_ids(db, getattr(args, 'library', None))
         cur = db.cursor()
         # Count triggers
         if db.is_pg:
@@ -428,12 +466,18 @@ def cmd_status(args):
             print(f"  - {name}")
 
         # Count HTTP URLs
-        db.execute(cur, "SELECT COUNT(*) AS cnt FROM media_parts WHERE file LIKE 'http%'")
+        join, lib_where, lib_params = _library_join(db, lib_ids, "mp")
+        ph = "%s" if db.is_pg else "?"
+        db.execute(cur,
+            f"SELECT COUNT(*) AS cnt FROM media_parts mp{join} WHERE mp.file LIKE {ph}{lib_where}",
+            ("http%",) + lib_params if lib_params else ("http%",))
         row = db.fetchone(cur)
         print(f"HTTP URLs: {row['cnt']}")
 
         # Count .strm paths
-        db.execute(cur, "SELECT COUNT(*) AS cnt FROM media_parts WHERE LOWER(file) LIKE '%.strm'")
+        db.execute(cur,
+            f"SELECT COUNT(*) AS cnt FROM media_parts mp{join} WHERE LOWER(mp.file) LIKE {ph}{lib_where}",
+            ("%.strm",) + lib_params if lib_params else ("%.strm",))
         row = db.fetchone(cur)
         print(f"Pending .strm files: {row['cnt']}")
 
@@ -613,10 +657,9 @@ def update_media_item(db, media_item_id, meta):
 
     cur = db.cursor()
     if db.is_pg:
-        sets = ", ".join(f"{k} = ${i+1}" for i, k in enumerate(updatable))
+        sets = ", ".join(f"{k} = %s" for k in updatable)
         vals = list(updatable.values()) + [media_item_id]
-        n = len(updatable) + 1
-        db.execute(cur, f"UPDATE media_items SET {sets} WHERE id = ${n}", tuple(vals))
+        db.execute(cur, f"UPDATE media_items SET {sets} WHERE id = %s", tuple(vals))
     else:
         sets = ", ".join(f"{k} = ?" for k in updatable)
         vals = list(updatable.values()) + [media_item_id]
@@ -630,7 +673,7 @@ def create_media_streams(db, media_item_id, meta):
 
     # Find media_part_id
     if db.is_pg:
-        db.execute(cur, "SELECT id FROM media_parts WHERE media_item_id = $1 LIMIT 1",
+        db.execute(cur, "SELECT id FROM media_parts WHERE media_item_id = %s LIMIT 1",
                    (media_item_id,))
     else:
         db.execute(cur, "SELECT id FROM media_parts WHERE media_item_id = ? LIMIT 1",
@@ -643,7 +686,7 @@ def create_media_streams(db, media_item_id, meta):
 
     # Check if streams already exist
     if db.is_pg:
-        db.execute(cur, "SELECT COUNT(*) AS cnt FROM media_streams WHERE media_item_id = $1",
+        db.execute(cur, "SELECT COUNT(*) AS cnt FROM media_streams WHERE media_item_id = %s",
                    (media_item_id,))
     else:
         db.execute(cur, "SELECT COUNT(*) AS cnt FROM media_streams WHERE media_item_id = ?",
@@ -672,7 +715,7 @@ def create_media_streams(db, media_item_id, meta):
             INSERT INTO media_streams
             (stream_type_id, media_item_id, codec, created_at, updated_at,
              {idx}, media_part_id, bitrate, url_index, {dflt}, forced, extra_data)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (1, media_item_id, video_codec, now, now, 0, media_part_id,
               video_bitrate, None, 0, 0, v_extra))
     else:
@@ -692,7 +735,7 @@ def create_media_streams(db, media_item_id, meta):
             INSERT INTO media_streams
             (stream_type_id, media_item_id, codec, language, created_at, updated_at,
              {idx}, media_part_id, channels, url_index, {dflt}, forced)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (2, media_item_id, audio_codec, "en", now, now, 1, media_part_id,
               audio_channels, None, 0, 0))
     else:
@@ -796,7 +839,7 @@ def _get_metadata_for_subtitle(db, media_item_id):
     cur = db.cursor()
     # media_item -> metadata_item
     if db.is_pg:
-        db.execute(cur, "SELECT metadata_item_id FROM media_items WHERE id = $1 LIMIT 1",
+        db.execute(cur, "SELECT metadata_item_id FROM media_items WHERE id = %s LIMIT 1",
                    (media_item_id,))
     else:
         db.execute(cur, "SELECT metadata_item_id FROM media_items WHERE id = ? LIMIT 1",
@@ -809,7 +852,7 @@ def _get_metadata_for_subtitle(db, media_item_id):
 
     # Get title, year
     if db.is_pg:
-        db.execute(cur, "SELECT title, year, guid FROM metadata_items WHERE id = $1", (mid,))
+        db.execute(cur, "SELECT title, year, guid FROM metadata_items WHERE id = %s", (mid,))
     else:
         db.execute(cur, "SELECT title, year, guid FROM metadata_items WHERE id = ?", (mid,))
     row = db.fetchone(cur)
@@ -824,7 +867,7 @@ def _get_metadata_for_subtitle(db, media_item_id):
     try:
         if db.is_pg:
             db.execute(cur,
-                "SELECT guid FROM guids WHERE metadata_item_id = $1 AND guid LIKE 'imdb://%' LIMIT 1",
+                "SELECT guid FROM guids WHERE metadata_item_id = %s AND guid LIKE 'imdb://%' LIMIT 1",
                 (mid,))
         else:
             db.execute(cur,
@@ -852,7 +895,7 @@ def _register_subtitle_in_db(db, media_item_id, subtitle_path, language):
 
     # Find media_part_id
     if db.is_pg:
-        db.execute(cur, "SELECT id FROM media_parts WHERE media_item_id = $1 LIMIT 1",
+        db.execute(cur, "SELECT id FROM media_parts WHERE media_item_id = %s LIMIT 1",
                    (media_item_id,))
     else:
         db.execute(cur, "SELECT id FROM media_parts WHERE media_item_id = ? LIMIT 1",
@@ -881,7 +924,7 @@ def _register_subtitle_in_db(db, media_item_id, subtitle_path, language):
             (stream_type_id, media_item_id, url, codec, language,
              created_at, updated_at, {idx}, media_part_id,
              channels, bitrate, url_index, {dflt}, forced, extra_data)
-            VALUES (3, $1, $2, 'srt', $3, $4, $5, NULL, $6, NULL, NULL, NULL, 0, 0, $7)
+            VALUES (3, %s, %s, 'srt', %s, %s, %s, NULL, %s, NULL, NULL, NULL, 0, 0, %s)
         """, (media_item_id, file_uri, language, now, now, media_part_id, extra))
     else:
         db.execute(cur, f"""
@@ -975,11 +1018,19 @@ def cmd_update(args):
             cur.close()
             log.info("Protection triggers installed")
 
+        # Resolve library filter
+        lib_ids = _resolve_library_ids(db, getattr(args, 'library', None))
+
         # Find .strm paths
         cur = db.cursor()
-        db.execute(cur,
-            "SELECT id, media_item_id, file FROM media_parts "
-            "WHERE file IS NOT NULL AND file != '' AND LOWER(file) LIKE '%.strm'")
+        join, lib_where, lib_params = _library_join(db, lib_ids, "mp")
+        ph = "%s" if db.is_pg else "?"
+        sql = (f"SELECT mp.id, mp.media_item_id, mp.file FROM media_parts mp"
+               f"{join}"
+               f" WHERE mp.file IS NOT NULL AND mp.file != ''"
+               f" AND LOWER(mp.file) LIKE {ph}{lib_where}")
+        params = ("%.strm",) + lib_params if lib_params else ("%.strm",)
+        db.execute(cur, sql, params)
         strm_rows = db.fetchall(cur)
         cur.close()
 
@@ -1014,7 +1065,7 @@ def cmd_update(args):
                 continue
 
             if db.is_pg:
-                db.execute(cur, "UPDATE media_parts SET file = $1 WHERE id = $2",
+                db.execute(cur, "UPDATE media_parts SET file = %s WHERE id = %s",
                            (direct_url, row["id"]))
             else:
                 db.execute(cur, "UPDATE media_parts SET file = ? WHERE id = ?",
@@ -1068,6 +1119,8 @@ def cmd_update(args):
                         failed += 1
 
                     total = analyzed + failed
+                    if total % 100 == 0:
+                        db.commit()
                     if total % 20 == 0:
                         elapsed = time.time() - t0
                         rate = total / elapsed if elapsed > 0 else 0
@@ -1130,7 +1183,7 @@ def cmd_revert(args):
         for row in rows:
             if db.is_pg:
                 # Temporarily disable triggers for revert
-                db.execute(cur, "UPDATE media_parts SET file = $1 WHERE id = $2",
+                db.execute(cur, "UPDATE media_parts SET file = %s WHERE id = %s",
                            (row["original_path"], row["part_id"]))
             else:
                 db.execute(cur, "UPDATE media_parts SET file = ? WHERE id = ?",
@@ -1164,6 +1217,9 @@ def main():
     db_group.add_argument("--db", metavar="PATH", help="path to Plex SQLite database")
     db_group.add_argument("--pg", action="store_true",
                           help="use PostgreSQL (configure via PLEX_PG_* env vars)")
+
+    parser.add_argument("--library", metavar="NAME", action="append",
+                        help="limit to specific library section(s) by name (repeatable)")
 
     sub = parser.add_subparsers(dest="command", required=True)
 

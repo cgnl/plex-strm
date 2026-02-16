@@ -31,6 +31,9 @@ plex-strm update --db /path/to/com.plexapp.plugins.library.db --protect
 export PLEX_PG_HOST=localhost PLEX_PG_DATABASE=plex PLEX_PG_USER=plex PLEX_PG_PASSWORD=plex
 plex-strm update --pg --protect
 
+# Limit to specific libraries
+plex-strm update --pg --protect --library "STRM Movies" --library "STRM TV Shows"
+
 # With subtitles
 export OPENSUB_API_KEY=... OPENSUB_USER=... OPENSUB_PASS=...
 plex-strm update --pg --protect --subtitles
@@ -46,6 +49,15 @@ plex-strm update --pg --protect --subtitles
 | `unprotect` | Remove all protection triggers |
 | `revert` | Revert URLs back to original .strm paths from backup |
 
+### Global options
+
+| Flag | Description |
+|------|-------------|
+| `--db PATH` | Path to Plex SQLite database |
+| `--pg` | Use PostgreSQL (configure via `PLEX_PG_*` env vars) |
+| `--library NAME` | Limit to specific library section(s) by name (repeatable) |
+| `-v` | Verbose output |
+
 ### Options for `update`
 
 | Flag | Description |
@@ -56,7 +68,6 @@ plex-strm update --pg --protect --subtitles
 | `--workers N` | FFprobe parallel workers (default: 4) |
 | `--timeout N` | FFprobe timeout per URL in seconds (default: 30) |
 | `--backup-dir DIR` | Directory for SQLite database backups |
-| `-v` | Verbose output |
 
 ## Environment variables
 
@@ -105,11 +116,24 @@ Four layers protect injected URLs from being overwritten by Plex during library 
 3. **Layer 3** — Auto-restores URLs from backup if they get removed
 4. **Layer 4** — Blocks URL truncation (prevents corruption)
 
-## Cron / systemd timer
+## Cron
 
-Run periodically to process new `.strm` files:
+Run periodically to process new `.strm` files as Plex scans them:
 
 ```bash
-# crontab -e
-0 */6 * * * cd /opt/plex-strm && python plex_strm.py update --pg --protect --subtitles 2>&1 | logger -t plex-strm
+*/5 * * * * /path/to/run-plex-strm.sh >> /path/to/plex-strm.log 2>&1
+```
+
+Example wrapper script:
+
+```bash
+#!/bin/bash
+export PLEX_PG_HOST=localhost
+export PLEX_PG_PORT=5432
+export PLEX_PG_DATABASE=plex
+export PLEX_PG_USER=plex
+export PLEX_PG_PASSWORD=plex
+export PLEX_PG_SCHEMA=plex
+
+python3 /path/to/plex_strm.py --pg --library "My STRM Library" update --protect
 ```
