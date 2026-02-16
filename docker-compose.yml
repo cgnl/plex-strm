@@ -1,0 +1,31 @@
+services:
+  plex-strm:
+    build: .
+    volumes:
+      # SQLite mode: mount the Plex database directory
+      # - /var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Plug-in Support/Databases:/data/plex
+      - ./backups:/backups
+      - ./subtitles:/subtitles
+    environment:
+      # --- SQLite mode ---
+      # PLEX_DB: /data/plex/com.plexapp.plugins.library.db
+
+      # --- PostgreSQL mode ---
+      PLEX_PG_HOST: postgres
+      PLEX_PG_PORT: "5432"
+      PLEX_PG_DATABASE: plex
+      PLEX_PG_USER: plex
+      PLEX_PG_PASSWORD: plex
+      PLEX_PG_SCHEMA: plex
+
+      BACKUP_DIR: /backups
+      FFPROBE_WORKERS: "4"
+      FFPROBE_TIMEOUT: "30"
+
+      # OpenSubtitles (optional)
+      # OPENSUB_API_KEY: ""
+      # OPENSUB_USER: ""
+      # OPENSUB_PASS: ""
+      SUBTITLE_LANGS: nl,en
+      SUBTITLE_DIR: /subtitles
+    command: ["update", "--pg", "--protect"]
