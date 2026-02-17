@@ -10,9 +10,10 @@ Supports both **SQLite** and **PostgreSQL** ([plex-postgresql](https://github.co
 2. Reads each `.strm` file to get the streaming URL inside
 3. Optionally rewrites the base URL (e.g. `localhost` → your public domain)
 4. Updates `media_parts.file` with the direct HTTP URL
-5. Runs FFprobe on each URL to extract codec, resolution, bitrate, etc.
-6. Creates `media_streams` entries (video + audio) so Plex shows correct info and enables Direct Play
+5. Runs FFprobe on each URL to extract **all** streams (video, audio, subtitle) with correct codecs, languages, channels, and bitrates
+6. Creates `media_streams` entries so Plex shows correct info and enables Direct Play
 7. Installs SQLite/PostgreSQL triggers that prevent Plex from reverting the URLs during library scans
+8. Optionally downloads missing subtitles from OpenSubtitles
 
 ## Using with Zurg
 
@@ -77,9 +78,12 @@ plex-strm update --pg --protect \
   --library "STRM Movies" --library "STRM TV Shows" \
   --base-url https://plex.example.com
 
-# With subtitles
+# With subtitles (download only missing languages)
 export OPENSUB_API_KEY=... OPENSUB_USER=... OPENSUB_PASS=...
-plex-strm update --pg --protect --subtitles
+plex-strm update --pg --protect --subtitles --subtitle-mode missing
+
+# Re-analyze items with incomplete metadata (e.g. ≤2 streams)
+plex-strm update --pg --reanalyze 2 --workers 8
 ```
 
 ### Commands
@@ -103,15 +107,18 @@ plex-strm update --pg --protect --subtitles
 
 ### Options for `update`
 
-| Flag | Description |
-|------|-------------|
-| `--base-url URL` | Rewrite STRM base URL for remote access (or env `STRM_BASE_URL`) |
-| `--protect` | Install trigger protection during update |
-| `--subtitles` | Download subtitles via OpenSubtitles API |
-| `--ffprobe PATH` | Path to ffprobe binary (default: `ffprobe`) |
-| `--workers N` | FFprobe parallel workers (default: 4) |
-| `--timeout N` | FFprobe timeout per URL in seconds (default: 30) |
-| `--backup-dir DIR` | Directory for SQLite database backups |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--base-url URL` | | Rewrite STRM base URL for remote access (or env `STRM_BASE_URL`) |
+| `--protect` | off | Install trigger protection during update |
+| `--subtitles` | off | Download subtitles via OpenSubtitles API |
+| `--subtitle-mode` | `missing` | `missing` = only download if language not in DB; `always` = download regardless |
+| `--ffprobe PATH` | `ffprobe` | Path to ffprobe binary |
+| `--workers N` | `4` | FFprobe parallel workers |
+| `--timeout N` | `30` | FFprobe timeout per URL in seconds |
+| `--retries N` | `2` | FFprobe retries per URL (only retries on timeouts/transient errors, not on dead links) |
+| `--reanalyze N` | off | Re-probe items with ≤ N existing streams (useful for fixing incomplete metadata) |
+| `--backup-dir DIR` | `.` | Directory for SQLite database backups |
 
 ## Environment variables
 
@@ -139,17 +146,46 @@ plex-strm update --pg --protect --subtitles
 
 | Variable | Description |
 |----------|-------------|
-| `OPENSUB_API_KEY` | OpenSubtitles API key |
+| `OPENSUB_API_KEY` | OpenSubtitles.com API key ([get one here](https://www.opensubtitles.com/consumers)) |
 | `OPENSUB_USER` | OpenSubtitles username |
 | `OPENSUB_PASS` | OpenSubtitles password |
-| `SUBTITLE_LANGS` | Comma-separated language codes (default: nl,en) |
-| `SUBTITLE_DIR` | Directory for downloaded .srt files (default: ./subtitles) |
+| `SUBTITLE_LANGS` | Comma-separated language codes (default: `en`) |
+| `SUBTITLE_DIR` | Directory for downloaded .srt files (default: `./subtitles`) |
 
 ### URL rewriting
 
 | Variable | Description |
 |----------|-------------|
 | `STRM_BASE_URL` | Rewrite base URL (alternative to `--base-url` flag) |
+
+## FFprobe details
+
+### Multi-stream support
+
+FFprobe extracts **all** video, audio, and subtitle streams from each URL — not just the primary ones. Each stream is written to `media_streams` with:
+
+- Correct codec, language, channels, bitrate
+- Default/forced flags preserved
+- Video profile (baseline/main/high/high10) and color transfer
+- Audio profile (LC/HE-AAC, DTS variants)
+- Subtitle hearing-impaired and title metadata
+
+### Smart retries
+
+FFprobe retries on timeouts and transient network errors, but **skips immediately** on server errors (403, 404, 5XX) since those indicate dead links. Failed items are written to `ffprobe_failures.log` for review.
+
+## Subtitle download
+
+When `--subtitles` is enabled, plex-strm searches OpenSubtitles.com for each processed media item:
+
+1. Searches by IMDb ID (most accurate) or falls back to title + year
+2. Downloads the most popular `.srt` file for each configured language
+3. Registers the subtitle as a `media_streams` entry (stream_type_id=3) in the Plex database
+
+### Subtitle modes
+
+- **`--subtitle-mode missing`** (default) — Only downloads a subtitle if that language doesn't already exist as a subtitle stream in the database. This prevents redundant downloads and API quota usage.
+- **`--subtitle-mode always`** — Downloads subtitles regardless of existing tracks. Useful if you want to replace embedded subtitles with better OpenSubtitles versions.
 
 ## Docker
 
@@ -166,11 +202,14 @@ Four layers protect injected URLs from being overwritten by Plex during library 
 3. **Layer 3** — Auto-restores URLs from backup if they get removed
 4. **Layer 4** — Blocks URL truncation (prevents corruption)
 
-## Cron
+Works with both SQLite triggers and PostgreSQL trigger functions.
 
-Run periodically to process new `.strm` files as Plex scans them:
+## Automation
+
+Run periodically to process new `.strm` files:
 
 ```bash
+# crontab
 */5 * * * * /path/to/run-plex-strm.sh >> /path/to/plex-strm.log 2>&1
 ```
 
@@ -179,13 +218,22 @@ Example wrapper script:
 ```bash
 #!/bin/bash
 export PLEX_PG_HOST=localhost
-export PLEX_PG_PORT=5432
 export PLEX_PG_DATABASE=plex
 export PLEX_PG_USER=plex
 export PLEX_PG_PASSWORD=plex
-export PLEX_PG_SCHEMA=plex
+
+# Optional: OpenSubtitles
+export OPENSUB_API_KEY=your-api-key
+export OPENSUB_USER=your-username
+export OPENSUB_PASS=your-password
+export SUBTITLE_LANGS=en
 
 python3 /path/to/plex_strm.py --pg \
   --library "My STRM Library" \
-  update --protect --base-url https://plex.example.com
+  update --protect --subtitles --subtitle-mode missing \
+  --base-url https://plex.example.com
 ```
+
+## License
+
+MIT

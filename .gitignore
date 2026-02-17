@@ -7,3 +7,5 @@ backups/
 subtitles/
 .venv/
 venv/
+ffprobe_failures.log
+*.log

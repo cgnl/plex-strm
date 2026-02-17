@@ -503,25 +503,62 @@ def cmd_status(args):
 # FFprobe analysis
 # ---------------------------------------------------------------------------
 
-def run_ffprobe(url, ffprobe_path="ffprobe", timeout=30):
-    """Run ffprobe on a URL and return parsed metadata dict, or None on failure."""
-    cmd = [ffprobe_path, "-v", "quiet", "-print_format", "json",
+def run_ffprobe(url, ffprobe_path="ffprobe", timeout=30, retries=2):
+    """Run ffprobe on a URL and return parsed metadata dict, or None on failure.
+    
+    Retries up to `retries` times on timeout or transient errors.
+    Does NOT retry on server errors (5XX, 4XX) — those are dead links.
+    """
+    cmd = [ffprobe_path, "-v", "error", "-print_format", "json",
            "-show_format", "-show_streams", url]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True,
-                                encoding="utf-8", errors="ignore", timeout=timeout)
-        if result.returncode != 0:
-            return None
-        data = json.loads(result.stdout)
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError) as e:
-        log.debug("FFprobe failed for %s: %s", url, e)
-        return None
+    url_id = url.rsplit("/", 1)[-1] if "/" in url else url[-30:]
+    last_error = None
 
-    return _parse_ffprobe(data)
+    for attempt in range(1 + retries):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    encoding="utf-8", errors="ignore", timeout=timeout)
+            if result.returncode != 0:
+                stderr_snip = (result.stderr or "")[:300].strip()
+                last_error = f"exit code {result.returncode}: {stderr_snip}"
+                # Don't retry on server errors — the link is dead
+                if any(x in stderr_snip.lower() for x in ("server error", "server returned",
+                        "403", "404", "410", "5xx", "forbidden", "not found")):
+                    log.warning("FFprobe FAILED [%s]: %s", url_id, last_error)
+                    return None
+                # Retry on other errors (network glitch, etc.)
+                if attempt < retries:
+                    time.sleep(1 * (attempt + 1))
+                    continue
+                log.warning("FFprobe FAILED after %d attempts [%s]: %s", attempt + 1, url_id, last_error)
+                return None
+            data = json.loads(result.stdout)
+            if attempt > 0:
+                log.info("FFprobe succeeded on retry %d [%s]", attempt, url_id)
+            return _parse_ffprobe(data)
+        except subprocess.TimeoutExpired:
+            last_error = f"timeout ({timeout}s)"
+            if attempt < retries:
+                time.sleep(1 * (attempt + 1))
+                continue
+            log.warning("FFprobe FAILED after %d attempts [%s]: %s", attempt + 1, url_id, last_error)
+            return None
+        except json.JSONDecodeError as e:
+            last_error = f"JSON parse error: {e}"
+            log.warning("FFprobe FAILED [%s]: %s", url_id, last_error)
+            return None
+        except FileNotFoundError:
+            log.error("FFprobe binary not found: %s", ffprobe_path)
+            return None
+
+    return None
 
 
 def _parse_ffprobe(data):
-    """Parse ffprobe JSON output into Plex metadata dict."""
+    """Parse ffprobe JSON output into Plex metadata dict.
+    
+    Collects ALL streams (video, audio, subtitle) for proper multi-language support.
+    """
     meta = {}
     fmt = data.get("format", {})
 
@@ -534,16 +571,27 @@ def _parse_ffprobe(data):
     if "format_name" in fmt:
         meta["container"] = fmt["format_name"].split(",")[0]
 
-    video_stream = None
-    audio_stream = None
+    video_streams = []
+    audio_streams = []
+    subtitle_streams = []
+
     for s in data.get("streams", []):
         ct = s.get("codec_type")
-        if ct == "video" and video_stream is None:
-            video_stream = s
-        elif ct == "audio" and audio_stream is None:
-            audio_stream = s
+        if ct == "video":
+            video_streams.append(s)
+        elif ct == "audio":
+            audio_streams.append(s)
+        elif ct == "subtitle":
+            subtitle_streams.append(s)
 
-    if video_stream:
+    # Store all streams for create_media_streams
+    meta["_video_streams"] = video_streams
+    meta["_audio_streams"] = audio_streams
+    meta["_subtitle_streams"] = subtitle_streams
+
+    # Primary video stream for media_items fields
+    if video_streams:
+        video_stream = video_streams[0]
         meta["width"] = video_stream.get("width", 1920)
         meta["height"] = video_stream.get("height", 1080)
         meta["video_codec"] = video_stream.get("codec_name", "h264")
@@ -588,7 +636,9 @@ def _parse_ffprobe(data):
         elif "bt2020" in trc or "2020" in trc:
             meta["color_trc"] = "bt2020"
 
-    if audio_stream:
+    # Primary audio stream for media_items fields
+    if audio_streams:
+        audio_stream = audio_streams[0]
         meta["audio_codec"] = audio_stream.get("codec_name", "aac")
         meta["audio_channels"] = audio_stream.get("channels", 2)
 
@@ -644,8 +694,7 @@ def update_media_item(db, media_item_id, meta):
         meta["extra_data"] = extra_data
 
     # Build dynamic UPDATE
-    # width/height are stored in media_items (not media_streams), but must NOT
-    # also appear in extra_data to avoid duplicate XML attributes in Plex output.
+    # Skip internal keys (_video_streams etc.) and profile fields (already in extra_data)
     updatable = {k: v for k, v in meta.items()
                  if k in ("duration", "size", "bitrate", "container", "width", "height",
                           "frames_per_second", "display_aspect_ratio", "video_codec",
@@ -666,84 +715,171 @@ def update_media_item(db, media_item_id, meta):
 
 
 def create_media_streams(db, media_item_id, meta):
-    """Insert video and audio stream entries for Direct Play."""
+    """Insert ALL video, audio, and subtitle stream entries from ffprobe data.
+    
+    Writes every stream with correct codec, language, channels, bitrate,
+    default/forced flags — no hardcoded values.
+    """
     cur = db.cursor()
 
     # Find media_part_id
-    if db.is_pg:
-        db.execute(cur, "SELECT id FROM media_parts WHERE media_item_id = %s LIMIT 1",
-                   (media_item_id,))
-    else:
-        db.execute(cur, "SELECT id FROM media_parts WHERE media_item_id = ? LIMIT 1",
-                   (media_item_id,))
+    ph = "%s" if db.is_pg else "?"
+    db.execute(cur, f"SELECT id FROM media_parts WHERE media_item_id = {ph} LIMIT 1",
+               (media_item_id,))
     row = db.fetchone(cur)
     if not row:
         cur.close()
         return
     media_part_id = row["id"]
 
-    # Check if streams already exist
-    if db.is_pg:
-        db.execute(cur, "SELECT COUNT(*) AS cnt FROM media_streams WHERE media_item_id = %s",
-                   (media_item_id,))
-    else:
-        db.execute(cur, "SELECT COUNT(*) AS cnt FROM media_streams WHERE media_item_id = ?",
-                   (media_item_id,))
-    if db.fetchone(cur)["cnt"] > 0:
-        cur.close()
-        return
+    # Delete existing streams (re-analyze: replace old incomplete data)
+    db.execute(cur, f"DELETE FROM media_streams WHERE media_item_id = {ph}",
+               (media_item_id,))
 
     now = int(time.time())
-    idx = db.q("index")
-    dflt = db.q("default")
+    idx_col = db.q("index")
+    dflt_col = db.q("default")
+    stream_index = 0
 
-    # Video stream extra_data
-    h = meta.get("height", 1080)
-    w = meta.get("width", 1920)
-    v_extra = json.dumps({
-        "ma:height": str(h), "ma:width": str(w),
-        "url": f"ma%3Aheight={h}&ma%3Awidth={w}"
-    })
+    # ── Video streams ────────────────────────────────────────────
+    for vs in meta.get("_video_streams", []):
+        codec = vs.get("codec_name")
+        if not codec:
+            continue
 
-    # Insert video stream (stream_type_id=1)
-    video_codec = meta.get("video_codec", "h264")
-    video_bitrate = meta.get("bitrate", 5000000)
-    if db.is_pg:
-        db.execute(cur, f"""
-            INSERT INTO media_streams
-            (stream_type_id, media_item_id, codec, created_at, updated_at,
-             {idx}, media_part_id, bitrate, url_index, {dflt}, forced, extra_data)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (1, media_item_id, video_codec, now, now, 0, media_part_id,
-              video_bitrate, None, 0, 0, v_extra))
-    else:
-        db.execute(cur, f"""
-            INSERT INTO media_streams
-            (stream_type_id, media_item_id, codec, created_at, updated_at,
-             {idx}, media_part_id, bitrate, url_index, {dflt}, forced, extra_data)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (1, media_item_id, video_codec, now, now, 0, media_part_id,
-              video_bitrate, None, 0, 0, v_extra))
+        lang = (vs.get("tags") or {}).get("language")
+        title = (vs.get("tags") or {}).get("title")
+        w = vs.get("width")
+        h = vs.get("height")
+        bitrate = vs.get("bit_rate")
+        if bitrate:
+            bitrate = int(bitrate)
+        elif meta.get("bitrate"):
+            bitrate = meta["bitrate"]
 
-    # Insert audio stream (stream_type_id=2)
-    audio_codec = meta.get("audio_codec", "aac")
-    audio_channels = meta.get("audio_channels", 2)
-    if db.is_pg:
+        disp = vs.get("disposition", {})
+        is_default = 1 if disp.get("default") else 0
+        is_forced = 1 if disp.get("forced") else 0
+
+        # Build extra_data
+        extra_parts = {}
+        if h:
+            extra_parts["ma:height"] = str(h)
+        if w:
+            extra_parts["ma:width"] = str(w)
+
+        profile = (vs.get("profile") or "").lower()
+        plex_profile = None
+        if "baseline" in profile:
+            plex_profile = "baseline"
+        elif "high" in profile and "10" in profile:
+            plex_profile = "high10"
+        elif "high" in profile:
+            plex_profile = "high"
+        elif "main" in profile:
+            plex_profile = "main"
+        elif profile:
+            plex_profile = profile
+        if plex_profile:
+            extra_parts["ma:videoProfile"] = plex_profile
+
+        url_parts = [f"ma%3A{k.split(':')[1]}={v}" for k, v in extra_parts.items()]
+        if url_parts:
+            extra_parts["url"] = "&".join(url_parts)
+        extra_data = json.dumps(extra_parts) if extra_parts else None
+
         db.execute(cur, f"""
             INSERT INTO media_streams
             (stream_type_id, media_item_id, codec, language, created_at, updated_at,
-             {idx}, media_part_id, channels, url_index, {dflt}, forced)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (2, media_item_id, audio_codec, "en", now, now, 1, media_part_id,
-              audio_channels, None, 0, 0))
-    else:
+             {idx_col}, media_part_id, bitrate, channels, url_index,
+             {dflt_col}, forced, extra_data)
+            VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+        """, (1, media_item_id, codec, lang, now, now, stream_index,
+              media_part_id, bitrate, None, None, is_default, is_forced, extra_data))
+        stream_index += 1
+
+    # ── Audio streams ────────────────────────────────────────────
+    for aus in meta.get("_audio_streams", []):
+        codec = aus.get("codec_name")
+        if not codec:
+            continue
+
+        lang = (aus.get("tags") or {}).get("language")
+        title = (aus.get("tags") or {}).get("title")
+        channels = aus.get("channels")
+        bitrate = aus.get("bit_rate")
+        if bitrate:
+            bitrate = int(bitrate)
+
+        disp = aus.get("disposition", {})
+        is_default = 1 if disp.get("default") else 0
+        is_forced = 1 if disp.get("forced") else 0
+
+        # Audio profile extra_data
+        a_profile = (aus.get("profile") or "").lower()
+        plex_profile = None
+        if "lc" in a_profile or "low complexity" in a_profile:
+            plex_profile = "lc"
+        elif "he" in a_profile or "high efficiency" in a_profile:
+            plex_profile = "he"
+        elif "main" in a_profile:
+            plex_profile = "main"
+        elif "dts" in a_profile:
+            plex_profile = a_profile
+
+        extra_parts = {}
+        if plex_profile:
+            extra_parts["ma:audioProfile"] = plex_profile
+        if channels:
+            extra_parts["ma:channels"] = str(channels)
+        url_parts = [f"ma%3A{k.split(':')[1]}={v}" for k, v in extra_parts.items()]
+        if url_parts:
+            extra_parts["url"] = "&".join(url_parts)
+        extra_data = json.dumps(extra_parts) if extra_parts else None
+
         db.execute(cur, f"""
             INSERT INTO media_streams
             (stream_type_id, media_item_id, codec, language, created_at, updated_at,
-             {idx}, media_part_id, channels, url_index, {dflt}, forced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (2, media_item_id, audio_codec, "en", now, now, 1, media_part_id,
-              audio_channels, None, 0, 0))
+             {idx_col}, media_part_id, bitrate, channels, url_index,
+             {dflt_col}, forced, extra_data)
+            VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+        """, (2, media_item_id, codec, lang, now, now, stream_index,
+              media_part_id, bitrate, channels, None, is_default, is_forced, extra_data))
+        stream_index += 1
+
+    # ── Subtitle streams ─────────────────────────────────────────
+    for ss in meta.get("_subtitle_streams", []):
+        codec = ss.get("codec_name")
+        if not codec:
+            continue
+
+        lang = (ss.get("tags") or {}).get("language")
+        title = (ss.get("tags") or {}).get("title")
+
+        disp = ss.get("disposition", {})
+        is_default = 1 if disp.get("default") else 0
+        is_forced = 1 if disp.get("forced") else 0
+        is_hearing_impaired = 1 if disp.get("hearing_impaired") else 0
+
+        extra_parts = {}
+        if is_hearing_impaired:
+            extra_parts["ma:hearingImpaired"] = "1"
+        if title:
+            extra_parts["ma:title"] = title
+        url_parts = [f"ma%3A{k.split(':')[1]}={v}" for k, v in extra_parts.items()]
+        if url_parts:
+            extra_parts["url"] = "&".join(url_parts)
+        extra_data = json.dumps(extra_parts) if extra_parts else None
+
+        db.execute(cur, f"""
+            INSERT INTO media_streams
+            (stream_type_id, media_item_id, codec, language, created_at, updated_at,
+             {idx_col}, media_part_id, bitrate, channels, url_index,
+             {dflt_col}, forced, extra_data)
+            VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+        """, (3, media_item_id, codec, lang, now, now, stream_index,
+              media_part_id, None, None, None, is_default, is_forced, extra_data))
+        stream_index += 1
 
     cur.close()
 
@@ -887,6 +1023,19 @@ def _get_metadata_for_subtitle(db, media_item_id):
     return info
 
 
+def _get_existing_subtitle_langs(db, media_item_id):
+    """Return set of language codes that already have subtitle streams in DB for this media item."""
+    cur = db.cursor()
+    ph = "%s" if db.is_pg else "?"
+    db.execute(cur,
+        f"SELECT DISTINCT language FROM media_streams "
+        f"WHERE media_item_id = {ph} AND stream_type_id = 3 AND language IS NOT NULL",
+        (media_item_id,))
+    rows = db.fetchall(cur)
+    cur.close()
+    return {r["language"] for r in rows}
+
+
 def _register_subtitle_in_db(db, media_item_id, subtitle_path, language):
     """Register a subtitle file as media_streams entry (stream_type_id=3)."""
     cur = db.cursor()
@@ -936,8 +1085,15 @@ def _register_subtitle_in_db(db, media_item_id, subtitle_path, language):
     cur.close()
 
 
-def download_subtitles(db, media_item_ids):
-    """Download subtitles for given media items via OpenSubtitles API."""
+def download_subtitles(db, media_item_ids, mode="missing"):
+    """Download subtitles for given media items via OpenSubtitles API.
+
+    Args:
+        db: PlexDB instance
+        media_item_ids: list of media_item IDs to process
+        mode: "missing" = only download if language not yet in DB,
+              "always" = download even if subtitle track exists
+    """
     api_key = os.environ.get("OPENSUB_API_KEY")
     username = os.environ.get("OPENSUB_USER")
     password = os.environ.get("OPENSUB_PASS")
@@ -950,11 +1106,12 @@ def download_subtitles(db, media_item_ids):
         log.error("OpenSubtitles login failed")
         return
 
-    langs = os.environ.get("SUBTITLE_LANGS", "nl,en").split(",")
+    langs = os.environ.get("SUBTITLE_LANGS", "en").split(",")
     sub_dir = os.environ.get("SUBTITLE_DIR", "./subtitles")
     os.makedirs(sub_dir, exist_ok=True)
 
     success = 0
+    skipped = 0
     for mid in media_item_ids:
         info = _get_metadata_for_subtitle(db, mid)
         if not info:
@@ -962,8 +1119,19 @@ def download_subtitles(db, media_item_ids):
         title = info["title"]
         safe_title = re.sub(r'[<>:"/\\|?*]', "_", title)
 
+        # In "missing" mode, check which subtitle languages already exist
+        existing_langs = set()
+        if mode == "missing":
+            existing_langs = _get_existing_subtitle_langs(db, mid)
+
         for lang in langs:
             lang = lang.strip()
+
+            # Skip if this language already has a subtitle track in DB
+            if mode == "missing" and lang in existing_langs:
+                skipped += 1
+                continue
+
             # Search
             if info["imdb_id"]:
                 results = _subtitle_search(api_key, token, imdb_id=info["imdb_id"], lang=lang)
@@ -975,9 +1143,10 @@ def download_subtitles(db, media_item_ids):
 
             fname = f"{safe_title}.{lang}.srt"
             fpath = os.path.join(sub_dir, fname)
-            if os.path.exists(fpath):
-                log.debug("Subtitle already exists: %s", fpath)
+            if os.path.exists(fpath) and mode == "missing":
+                log.debug("Subtitle already exists on disk: %s", fpath)
                 _register_subtitle_in_db(db, mid, fpath, lang)
+                skipped += 1
                 continue
 
             if _subtitle_download(api_key, token, results[0]["id"], fpath):
@@ -986,7 +1155,7 @@ def download_subtitles(db, media_item_ids):
                 success += 1
                 time.sleep(0.3)  # rate limit
 
-    log.info("Downloaded %d subtitles", success)
+    log.info("Subtitles: %d downloaded, %d skipped (mode=%s)", success, skipped, mode)
 
 
 # ---------------------------------------------------------------------------
@@ -1032,17 +1201,15 @@ def cmd_update(args):
         strm_rows = db.fetchall(cur)
         cur.close()
 
-        if not strm_rows:
-            log.info("No .strm files found in database")
-            db.commit()
-            db.close()
-            return
-
-        log.info("Found %d .strm entries", len(strm_rows))
-
         # Replace .strm paths with direct URLs
         url_mapping = {}  # media_item_id -> url
         updated = 0
+
+        if not strm_rows:
+            log.info("No .strm files found in database (all already converted)")
+        else:
+            log.info("Found %d .strm entries", len(strm_rows))
+
         cur = db.cursor()
 
         for row in strm_rows:
@@ -1110,29 +1277,58 @@ def cmd_update(args):
             log.info("Found %d HTTP URLs missing media_streams, adding to FFprobe queue", len(missing))
             url_mapping.update(missing)
 
+        # --reanalyze: re-probe items with incomplete stream data (≤ max_streams)
+        reanalyze_max = getattr(args, 'reanalyze', None)
+        if reanalyze_max is not None:
+            cur = db.cursor()
+            ph = "%s" if db.is_pg else "?"
+            join, lib_where, lib_params = _library_join(db, lib_ids, "mp")
+            if lib_params:
+                reanalyze_params = ("http%",) + tuple(lib_params) + (reanalyze_max,)
+            else:
+                reanalyze_params = ("http%", reanalyze_max)
+            db.execute(cur,
+                f"SELECT mp.media_item_id, mp.file FROM media_parts mp"
+                f"{join}"
+                f" WHERE mp.file LIKE {ph}{lib_where}"
+                f" AND (SELECT COUNT(*) FROM media_streams ms"
+                f"      WHERE ms.media_item_id = mp.media_item_id) <= {ph}",
+                reanalyze_params)
+            reanalyze_rows = {r["media_item_id"]: r["file"] for r in db.fetchall(cur)}
+            cur.close()
+            # Only add items not already in url_mapping
+            new_reanalyze = {k: v for k, v in reanalyze_rows.items() if k not in url_mapping}
+            if new_reanalyze:
+                log.info("Reanalyze: found %d items with <= %d streams, adding to FFprobe queue",
+                         len(new_reanalyze), reanalyze_max)
+                url_mapping.update(new_reanalyze)
+
         # FFprobe analysis
         if url_mapping:
             ffprobe_path = args.ffprobe or os.environ.get("FFPROBE_PATH", "ffprobe")
             workers = args.workers or int(os.environ.get("FFPROBE_WORKERS", "4"))
             timeout = args.timeout or int(os.environ.get("FFPROBE_TIMEOUT", "30"))
+            retries = args.retries if hasattr(args, 'retries') and args.retries is not None else 2
 
-            log.info("Running FFprobe analysis on %d URLs (%d workers)...",
-                     len(url_mapping), workers)
+            log.info("Running FFprobe analysis on %d URLs (%d workers, %d retries)...",
+                     len(url_mapping), workers, retries)
 
             analyzed = 0
             failed = 0
+            failed_items = []  # (media_item_id, url) for failure log
             t0 = time.time()
 
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {
-                    executor.submit(run_ffprobe, url, ffprobe_path, timeout): mid
+                    executor.submit(run_ffprobe, url, ffprobe_path, timeout, retries): mid
                     for mid, url in url_mapping.items()
                 }
                 for future in as_completed(futures):
                     mid = futures[future]
                     try:
                         meta = future.result()
-                    except Exception:
+                    except Exception as e:
+                        log.warning("FFprobe exception for media_item_id %d: %s", mid, e)
                         meta = None
 
                     if meta:
@@ -1141,24 +1337,40 @@ def cmd_update(args):
                         analyzed += 1
                     else:
                         failed += 1
+                        failed_items.append((mid, url_mapping[mid]))
 
                     total = analyzed + failed
                     if total % 10 == 0:
                         db.commit()
-                    if total % 20 == 0:
+                    if total % 100 == 0:
                         elapsed = time.time() - t0
                         rate = total / elapsed if elapsed > 0 else 0
-                        log.info("FFprobe: %d/%d (%.1f/s, %d failed)",
-                                 total, len(url_mapping), rate, failed)
+                        eta_s = (len(url_mapping) - total) / rate if rate > 0 else 0
+                        eta_m = int(eta_s / 60)
+                        log.info("FFprobe: %d/%d (%.1f/s, %d ok, %d failed, ETA ~%dm)",
+                                 total, len(url_mapping), rate, analyzed, failed, eta_m)
 
             db.commit()
             elapsed = time.time() - t0
             log.info("FFprobe done: %d analyzed, %d failed (%.1fs)", analyzed, failed, elapsed)
 
+            # Write failed items to a separate log file for future retry
+            if failed_items:
+                fail_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffprobe_failures.log")
+                with open(fail_log, "w", encoding="utf-8") as f:
+                    f.write(f"# FFprobe failures: {len(failed_items)} items\n")
+                    f.write(f"# Generated: {datetime.now().isoformat()}\n")
+                    f.write(f"# Total: {analyzed + failed}, OK: {analyzed}, Failed: {failed}\n\n")
+                    for mid, url in failed_items:
+                        url_id = url.rsplit("/", 1)[-1] if "/" in url else url[-30:]
+                        f.write(f"{mid}\t{url_id}\t{url}\n")
+                log.info("Failed items written to %s", fail_log)
+
         # Subtitles
         if args.subtitles and url_mapping:
-            log.info("Downloading subtitles for %d items...", len(url_mapping))
-            download_subtitles(db, list(url_mapping.keys()))
+            sub_mode = getattr(args, 'subtitle_mode', 'missing') or 'missing'
+            log.info("Downloading subtitles for %d items (mode=%s)...", len(url_mapping), sub_mode)
+            download_subtitles(db, list(url_mapping.keys()), mode=sub_mode)
             db.commit()
 
     except Exception as e:
@@ -1261,13 +1473,21 @@ def main():
                           help="install 4-layer trigger protection")
     p_update.add_argument("--subtitles", action="store_true",
                           help="download subtitles via OpenSubtitles API")
+    p_update.add_argument("--subtitle-mode", choices=["missing", "always"],
+                          default="missing",
+                          help="missing = only download if language not yet in DB (default), "
+                               "always = download even if subtitle track already exists")
     p_update.add_argument("--ffprobe", metavar="PATH", help="path to ffprobe binary")
     p_update.add_argument("--workers", type=int, default=4,
                           help="FFprobe parallel workers (default: 4)")
     p_update.add_argument("--timeout", type=int, default=30,
                           help="FFprobe timeout per URL in seconds (default: 30)")
     p_update.add_argument("--backup-dir", metavar="DIR",
-                          help="directory for database backups")
+                           help="directory for database backups")
+    p_update.add_argument("--reanalyze", metavar="N", type=int, default=None,
+                           help="re-analyze items with <= N streams (e.g. --reanalyze 2 for incomplete)")
+    p_update.add_argument("--retries", type=int, default=2,
+                           help="number of FFprobe retries per URL on failure (default: 2)")
 
     # status
     sub.add_parser("status", help="show protection status and URL counts")

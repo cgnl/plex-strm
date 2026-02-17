@@ -22,10 +22,10 @@ services:
       FFPROBE_WORKERS: "4"
       FFPROBE_TIMEOUT: "30"
 
-      # OpenSubtitles (optional)
+      # OpenSubtitles (optional — get API key from https://www.opensubtitles.com/consumers)
       # OPENSUB_API_KEY: ""
       # OPENSUB_USER: ""
       # OPENSUB_PASS: ""
-      SUBTITLE_LANGS: nl,en
+      SUBTITLE_LANGS: en
       SUBTITLE_DIR: /subtitles
-    command: ["update", "--pg", "--protect"]
+    command: ["update", "--pg", "--protect", "--subtitles", "--subtitle-mode", "missing"]
