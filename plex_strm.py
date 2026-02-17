@@ -171,13 +171,16 @@ def cmd_update(args):
             db.commit()
 
         # Also find existing HTTP URLs missing media_streams
+        # Skip items marked as permanently failed (media_analysis_version = -1)
         cur = db.cursor()
         ph = "%s" if db.is_pg else "?"
         join, lib_where, lib_params = library_join(db, lib_ids, "mp")
         db.execute(cur,
             f"SELECT mp.media_item_id, mp.file FROM media_parts mp"
+            f" JOIN media_items mi_chk ON mi_chk.id = mp.media_item_id"
             f"{join}"
             f" WHERE mp.file LIKE {ph}{lib_where}"
+            f" AND mi_chk.media_analysis_version != -1"
             f" AND mp.media_item_id NOT IN ("
             f"   SELECT DISTINCT media_item_id FROM media_streams"
             f" )",
@@ -358,8 +361,23 @@ def cmd_update(args):
                     log.info("Post-repair retry: %d recovered, %d still failed",
                              retry_ok, retry_fail)
 
-            # Write failed items log
+            # Mark permanently failed items (5XX) so they're skipped next run
+            # media_analysis_version = -1 means "broken source, don't retry"
             if failed_items:
+                ph = "%s" if db.is_pg else "?"
+                cur = db.cursor()
+                marked = 0
+                for mid, url in failed_items:
+                    db.execute(cur,
+                        f"UPDATE media_items SET media_analysis_version = -1 WHERE id = {ph}",
+                        (mid,))
+                    marked += 1
+                db.commit()
+                cur.close()
+                if marked:
+                    log.info("Marked %d failed items with media_analysis_version=-1 (skipped next run)",
+                             marked)
+
                 fail_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffprobe_failures.log")
                 with open(fail_log, "w", encoding="utf-8") as f:
                     f.write(f"# FFprobe failures: {len(failed_items)} items\n")
