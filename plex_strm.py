@@ -930,10 +930,11 @@ def _validate_imdb_id(imdb_id):
     return imdb_id
 
 
-def _subtitle_search(api_key, token, imdb_id=None, title=None, year=None, lang="en"):
+def _subtitle_search(api_key, token, imdb_id=None, tmdb_id=None, title=None, year=None, lang="en"):
     """Search OpenSubtitles API. Returns list of subtitle dicts with match validation.
 
-    When searching by title (no IMDb ID), validates that the returned feature
+    Search priority: IMDb ID > TMDB ID > title+year.
+    When searching by title, validates that the returned feature
     matches our year to avoid downloading subtitles for the wrong movie.
     """
     import requests
@@ -948,6 +949,9 @@ def _subtitle_search(api_key, token, imdb_id=None, title=None, year=None, lang="
     if imdb_id:
         params["imdb_id"] = imdb_id.replace("tt", "")
         searched_by = "imdb"
+    elif tmdb_id:
+        params["tmdb_id"] = str(tmdb_id)
+        searched_by = "tmdb"
     elif title:
         clean = _clean_title_for_search(title)
         if not clean:
@@ -1067,47 +1071,55 @@ def _get_metadata_for_subtitle(db, media_item_id):
         return None
 
     info = {"title": row["title"], "year": row["year"], "imdb_id": None,
+            "tmdb_id": None, "tvdb_id": None,
             "metadata_item_id": mid, "media_item_id": media_item_id}
 
-    # Try to find IMDb ID — different Plex versions store this differently.
-    # Each attempt uses a savepoint so a missing table won't abort the transaction.
+    # Look up external IDs (IMDb, TMDB, TVDB).
+    # Different Plex versions store these in different tables.
+    # Each attempt uses a savepoint so a missing table won't abort the PG transaction.
     ph = "%s" if db.is_pg else "?"
-    imdb_queries = [
+    like_esc = "%%" if db.is_pg else "%"
+
+    ext_id_queries = [
         # 1. tags + taggings (PostgreSQL / plex-postgresql)
-        (f"SELECT t.tag AS imdb_tag FROM taggings tg "
+        (f"SELECT t.tag FROM taggings tg "
          f"JOIN tags t ON tg.tag_id = t.id "
-         f"WHERE tg.metadata_item_id = {ph} AND t.tag LIKE 'imdb://%%' LIMIT 1"
-         if db.is_pg else
-         "SELECT t.tag AS imdb_tag FROM taggings tg "
-         "JOIN tags t ON tg.tag_id = t.id "
-         f"WHERE tg.metadata_item_id = {ph} AND t.tag LIKE 'imdb://%' LIMIT 1"),
+         f"WHERE tg.metadata_item_id = {ph} "
+         f"AND (t.tag LIKE 'imdb://{like_esc}' "
+         f"  OR t.tag LIKE 'tmdb://{like_esc}' "
+         f"  OR t.tag LIKE 'tvdb://{like_esc}')"),
         # 2. guids table (newer Plex SQLite versions)
-        (f"SELECT guid AS imdb_tag FROM guids "
-         f"WHERE metadata_item_id = {ph} AND guid LIKE 'imdb://%%' LIMIT 1"
-         if db.is_pg else
-         f"SELECT guid AS imdb_tag FROM guids "
-         f"WHERE metadata_item_id = {ph} AND guid LIKE 'imdb://%' LIMIT 1"),
+        (f"SELECT guid AS tag FROM guids "
+         f"WHERE metadata_item_id = {ph} "
+         f"AND (guid LIKE 'imdb://{like_esc}' "
+         f"  OR guid LIKE 'tmdb://{like_esc}' "
+         f"  OR guid LIKE 'tvdb://{like_esc}')"),
     ]
 
-    for imdb_sql in imdb_queries:
-        if info["imdb_id"]:
-            break
+    for ext_sql in ext_id_queries:
+        if info["imdb_id"] and info["tmdb_id"]:
+            break  # Got everything we need
         try:
             if db.is_pg:
-                db.execute(cur, "SAVEPOINT imdb_lookup")
-            db.execute(cur, imdb_sql, (mid,))
-            grow = db.fetchone(cur)
-            if grow and grow.get("imdb_tag"):
-                imdb = grow["imdb_tag"].replace("imdb://", "")
-                if not imdb.startswith("tt"):
-                    imdb = "tt" + imdb
-                info["imdb_id"] = imdb
+                db.execute(cur, "SAVEPOINT ext_id_lookup")
+            db.execute(cur, ext_sql, (mid,))
+            for grow in db.fetchall(cur):
+                tag = grow.get("tag", "")
+                if tag.startswith("imdb://") and not info["imdb_id"]:
+                    imdb = tag.replace("imdb://", "")
+                    if not imdb.startswith("tt"):
+                        imdb = "tt" + imdb
+                    info["imdb_id"] = imdb
+                elif tag.startswith("tmdb://") and not info["tmdb_id"]:
+                    info["tmdb_id"] = tag.replace("tmdb://", "")
+                elif tag.startswith("tvdb://") and not info["tvdb_id"]:
+                    info["tvdb_id"] = tag.replace("tvdb://", "")
             if db.is_pg:
-                db.execute(cur, "RELEASE SAVEPOINT imdb_lookup")
+                db.execute(cur, "RELEASE SAVEPOINT ext_id_lookup")
         except Exception:
             if db.is_pg:
                 try:
-                    db.execute(cur, "ROLLBACK TO SAVEPOINT imdb_lookup")
+                    db.execute(cur, "ROLLBACK TO SAVEPOINT ext_id_lookup")
                 except Exception:
                     pass
 
@@ -1233,9 +1245,12 @@ def download_subtitles(db, media_item_ids, mode="missing"):
                 skipped += 1
                 continue
 
-            # Search — prefer IMDb ID (exact match), fall back to cleaned title
+            # Search — prefer IMDb ID > TMDB ID > cleaned title
+            tmdb_id = info.get("tmdb_id")
             if imdb_id:
                 results = _subtitle_search(api_key, token, imdb_id=imdb_id, lang=lang)
+            elif tmdb_id:
+                results = _subtitle_search(api_key, token, tmdb_id=tmdb_id, lang=lang)
             else:
                 results = _subtitle_search(api_key, token, title=title,
                                            year=info["year"], lang=lang)
