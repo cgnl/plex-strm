@@ -888,13 +888,63 @@ def create_media_streams(db, media_item_id, meta):
 # OpenSubtitles
 # ---------------------------------------------------------------------------
 
+def _build_zurgtorrent_index(data_dir):
+    """Parse all .zurgtorrent files and build RD-ID → torrent-hash mapping.
+
+    Returns:
+        rd_id_to_hash: dict mapping RD download IDs (from /strm/<ID>) to torrent hashes
+        hash_to_state: dict mapping torrent hashes to their State value
+    """
+    rd_id_to_hash = {}
+    hash_to_state = {}
+    if not data_dir or not os.path.isdir(data_dir):
+        return rd_id_to_hash, hash_to_state
+
+    count = 0
+    for fname in os.listdir(data_dir):
+        if not fname.endswith('.zurgtorrent'):
+            continue
+        path = os.path.join(data_dir, fname)
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        h = d.get('Hash', '')
+        state = d.get('State', '')
+        if h:
+            hash_to_state[h] = state
+        for finfo in (d.get('SelectedFiles') or {}).values():
+            link = finfo.get('Link', '')
+            if '/d/' in link:
+                rd_id = link.rsplit('/', 1)[-1]
+                rd_id_to_hash[rd_id] = h
+                count += 1
+
+    log.info("Zurgtorrent index: %d RD IDs → %d unique torrent hashes",
+             count, len(hash_to_state))
+    return rd_id_to_hash, hash_to_state
+
+
+def _extract_rd_id_from_url(url):
+    """Extract the RD download ID from a Zurg STRM URL.
+
+    Example: https://user:pass@host/strm/LTGLPYW5QQJMO3D6 → LTGLPYW5QQJMO3D6
+    """
+    if not url:
+        return None
+    # The RD ID is the last path segment after /strm/
+    m = re.search(r'/strm/([A-Za-z0-9]+)$', url)
+    return m.group(1) if m else None
+
+
 def _trigger_zurg_repair(zurg_url):
     """Trigger Zurg repair-all via POST /torrents/repair. Returns True on success."""
     import requests
     try:
         resp = requests.post(f"{zurg_url.rstrip('/')}/torrents/repair", timeout=30)
         if resp.status_code == 200:
-            log.info("Zurg repair triggered successfully")
+            log.info("Zurg repair-all triggered successfully")
             return True
         log.warning("Zurg repair returned status %d", resp.status_code)
     except Exception as e:
@@ -902,12 +952,34 @@ def _trigger_zurg_repair(zurg_url):
     return False
 
 
+def _trigger_zurg_repair_torrents(zurg_url, torrent_hashes):
+    """Trigger per-torrent repair via POST /manage/{hash}/repair.
+
+    Returns set of hashes that were successfully submitted for repair.
+    Zurg returns 303 See Other on success (redirect to manage page).
+    """
+    import requests
+    base = zurg_url.rstrip('/')
+    repaired = set()
+    for h in torrent_hashes:
+        try:
+            resp = requests.post(f"{base}/manage/{h}/repair",
+                                 timeout=15, allow_redirects=False)
+            if resp.status_code in (200, 303):
+                repaired.add(h)
+            else:
+                log.debug("Repair %s returned status %d", h[:12], resp.status_code)
+        except Exception as e:
+            log.debug("Repair %s failed: %s", h[:12], e)
+    log.info("Per-torrent repair: submitted %d/%d torrents",
+             len(repaired), len(torrent_hashes))
+    return repaired
+
+
 def _is_server_error_url(mid, url):
     """Check if a failed URL is likely a server error (5XX / unrestrict failure).
-    We track this by attempting a HEAD request — but since we don't cache the error type
-    from FFprobe, we simply return True (all failed items are candidates for repair)."""
-    # All items that failed FFprobe are potential repair candidates.
-    # Zurg repair is idempotent and fast, so it's safe to trigger for all failures.
+    All items that failed FFprobe are potential repair candidates.
+    Zurg repair is idempotent and fast, so it's safe to trigger for all failures."""
     return True
 
 
@@ -1530,26 +1602,77 @@ def cmd_update(args):
             elapsed = time.time() - t0
             log.info("FFprobe done: %d analyzed, %d failed (%.1fs)", analyzed, failed, elapsed)
 
-            # Zurg repair + retry: if we have server errors and a Zurg URL, trigger repair
+            # Zurg repair + retry: if we have failures and a Zurg URL, trigger repair
             zurg_url = getattr(args, 'zurg_url', None)
+            zurg_data_dir = getattr(args, 'zurg_data_dir', None)
             server_error_items = [(mid, url) for mid, url in failed_items
                                   if _is_server_error_url(mid, url)]
             if zurg_url and server_error_items:
-                log.info("Triggering Zurg repair for %d server-error items...",
+                log.info("Triggering Zurg repair for %d failed items...",
                          len(server_error_items))
-                repair_ok = _trigger_zurg_repair(zurg_url)
+
+                # Build zurgtorrent index for per-torrent repair if data dir available
+                rd_index, hash_states = {}, {}
+                if zurg_data_dir:
+                    rd_index, hash_states = _build_zurgtorrent_index(zurg_data_dir)
+
+                repair_ok = False
+                repaired_hashes = set()
+                if rd_index:
+                    # Per-torrent repair: map failed RD IDs → unique torrent hashes
+                    failed_hashes = set()
+                    rd_id_to_mid = {}  # track which mids map to which hashes
+                    for mid, url in server_error_items:
+                        rd_id = _extract_rd_id_from_url(url)
+                        if rd_id and rd_id in rd_index:
+                            h = rd_index[rd_id]
+                            failed_hashes.add(h)
+                            rd_id_to_mid.setdefault(h, []).append(mid)
+                        else:
+                            # Unknown RD ID — will still be retried after repair
+                            pass
+
+                    if failed_hashes:
+                        log.info("Mapped %d failed items to %d unique torrents",
+                                 len(server_error_items), len(failed_hashes))
+                        repaired_hashes = _trigger_zurg_repair_torrents(
+                            zurg_url, failed_hashes)
+                        repair_ok = len(repaired_hashes) > 0
+                    else:
+                        log.info("No RD IDs matched zurgtorrent index, falling back to repair-all")
+                        repair_ok = _trigger_zurg_repair(zurg_url)
+                else:
+                    # No zurgtorrent data — fall back to repair-all
+                    repair_ok = _trigger_zurg_repair(zurg_url)
+
                 if repair_ok:
-                    # Wait for repair to process
-                    repair_wait = min(120, max(30, len(server_error_items) // 10))
-                    log.info("Waiting %ds for Zurg repair to complete...", repair_wait)
+                    # Wait for repair to process — scale wait by number of torrents
+                    n_torrents = len(repaired_hashes) if repaired_hashes else len(server_error_items)
+                    repair_wait = min(120, max(15, n_torrents * 2))
+                    log.info("Waiting %ds for Zurg repair to complete (%d torrents)...",
+                             repair_wait, n_torrents)
                     time.sleep(repair_wait)
 
-                    # Retry only the server-error items
-                    log.info("Retrying %d previously failed items after repair...",
-                             len(server_error_items))
+                    # Determine which items to retry
+                    if repaired_hashes and rd_index:
+                        # Only retry items whose torrent was actually repaired
+                        retry_items = []
+                        for mid, url in server_error_items:
+                            rd_id = _extract_rd_id_from_url(url)
+                            if rd_id and rd_id in rd_index:
+                                if rd_index[rd_id] in repaired_hashes:
+                                    retry_items.append((mid, url))
+                            else:
+                                # Unknown mapping — retry anyway
+                                retry_items.append((mid, url))
+                    else:
+                        retry_items = server_error_items
+
+                    log.info("Retrying %d items after repair (of %d total failed)...",
+                             len(retry_items), len(server_error_items))
                     retry_ok = 0
                     retry_fail = 0
-                    retry_mapping = {mid: url for mid, url in server_error_items}
+                    retry_mapping = {mid: url for mid, url in retry_items}
                     workers = int(os.environ.get("FFPROBE_WORKERS", args.workers or 4))
                     probe_timeout = int(os.environ.get("FFPROBE_TIMEOUT", args.timeout or 30))
                     probe_path = args.ffprobe or os.environ.get("FFPROBE_PATH", "ffprobe")
@@ -1720,6 +1843,10 @@ def main():
     p_update.add_argument("--zurg-url", metavar="URL",
                           help="Zurg base URL for triggering repair on 5XX failures "
                                "(e.g. http://user:pass@localhost:9091)")
+    p_update.add_argument("--zurg-data-dir", metavar="DIR",
+                          help="Path to Zurg data directory containing .zurgtorrent files. "
+                               "Enables per-torrent repair instead of repair-all. "
+                               "(e.g. /Users/sander/bin/zurg/data)")
 
     # status
     sub.add_parser("status", help="show protection status and URL counts")

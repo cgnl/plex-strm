@@ -150,6 +150,7 @@ plex-strm update --pg --reanalyze 2 --workers 8
 | `--retries N` | `2` | FFprobe retries per URL (only retries on timeouts/transient errors, not on dead links) |
 | `--reanalyze N` | off | Re-probe items with ≤ N existing streams (useful for fixing incomplete metadata) |
 | `--zurg-url URL` | | Zurg base URL; triggers repair + retry on 5XX failures (e.g. `http://user:pass@localhost:9091`) |
+| `--zurg-data-dir DIR` | | Path to Zurg data directory (`.zurgtorrent` files). Enables per-torrent repair instead of repair-all |
 | `--backup-dir DIR` | `.` | Directory for SQLite database backups |
 
 ## Environment variables
@@ -212,9 +213,19 @@ FFprobe retries on timeouts and transient network errors, but **skips immediatel
 When `--zurg-url` is set, plex-strm automatically triggers Zurg's repair process after FFprobe encounters server errors:
 
 1. FFprobe runs on all items, collecting failures
-2. If there are failures, `POST /torrents/repair` is sent to Zurg
-3. Waits for repair to complete (30-120s depending on failure count)
-4. Retries all previously failed items
+2. Failed URLs are mapped to torrent hashes (if `--zurg-data-dir` is set)
+3. Per-torrent repair requests are sent (`POST /manage/{hash}/repair`)
+4. Waits for repair to complete (scaled by number of affected torrents)
+5. Only retries items whose specific torrents were repaired
+
+**Per-torrent repair** (with `--zurg-data-dir`):
+- Parses `.zurgtorrent` files to build an RD download ID → torrent hash index
+- Only repairs the specific broken torrents (not all 23K+), making repair much faster
+- Retries are targeted to items whose torrents were actually submitted for repair
+
+**Fallback** (without `--zurg-data-dir`):
+- Falls back to `POST /torrents/repair` (repair-all)
+- Retries all failed items after a global wait
 
 This recovers torrents that RealDebrid temporarily couldn't serve.
 
