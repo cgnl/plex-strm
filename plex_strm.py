@@ -1060,17 +1060,19 @@ def _get_metadata_for_subtitle(db, media_item_id):
         return None
     mid = row["metadata_item_id"]
 
-    # Get title, year
+    # Get title, year, original_title
     if db.is_pg:
-        db.execute(cur, "SELECT title, year, guid FROM metadata_items WHERE id = %s", (mid,))
+        db.execute(cur, "SELECT title, original_title, year, guid FROM metadata_items WHERE id = %s", (mid,))
     else:
-        db.execute(cur, "SELECT title, year, guid FROM metadata_items WHERE id = ?", (mid,))
+        db.execute(cur, "SELECT title, original_title, year, guid FROM metadata_items WHERE id = ?", (mid,))
     row = db.fetchone(cur)
     if not row:
         cur.close()
         return None
 
-    info = {"title": row["title"], "year": row["year"], "imdb_id": None,
+    original = row.get("original_title") or ""
+    info = {"title": row["title"], "original_title": original if original != row["title"] else "",
+            "year": row["year"], "imdb_id": None,
             "tmdb_id": None, "tvdb_id": None,
             "metadata_item_id": mid, "media_item_id": media_item_id}
 
@@ -1276,7 +1278,7 @@ def download_subtitles(db, media_item_ids, mode="missing"):
                 skipped += 1
                 continue
 
-            # Search — prefer IMDb ID > TMDB ID > cleaned title
+            # Search — prefer IMDb ID > TMDB ID > title > original_title
             tmdb_id = info.get("tmdb_id")
             if imdb_id:
                 results = _subtitle_search(api_key, token, imdb_id=imdb_id, lang=lang)
@@ -1285,6 +1287,10 @@ def download_subtitles(db, media_item_ids, mode="missing"):
             else:
                 results = _subtitle_search(api_key, token, title=title,
                                            year=info["year"], lang=lang)
+                # Fallback: try original_title if title search found nothing
+                if not results and info.get("original_title"):
+                    results = _subtitle_search(api_key, token, title=info["original_title"],
+                                               year=info["year"], lang=lang)
             if not results:
                 continue
 
