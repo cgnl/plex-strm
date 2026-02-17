@@ -888,8 +888,54 @@ def create_media_streams(db, media_item_id, meta):
 # OpenSubtitles
 # ---------------------------------------------------------------------------
 
+def _clean_title_for_search(title):
+    """Clean a title for OpenSubtitles search.
+
+    Strips CJK characters, Cyrillic, website spam, bracketed junk,
+    and tries to extract the English portion of the title.
+    """
+    if not title:
+        return ""
+    # Remove bracketed content: 【...】, [...], (...)  with non-Latin chars
+    title = re.sub(r'[【\[][^】\]]*[】\]]', ' ', title)
+    # Remove website spam patterns
+    title = re.sub(r'(?i)\b(www\s*\.?\s*\w+\s*\.?\s*(?:com|net|org|info))\b', ' ', title)
+    # Remove CJK characters (Chinese/Japanese/Korean)
+    title = re.sub(r'[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]+', ' ', title)
+    # Remove Cyrillic characters
+    title = re.sub(r'[\u0400-\u04ff]+', ' ', title)
+    # Remove Arabic characters
+    title = re.sub(r'[\u0600-\u06ff]+', ' ', title)
+    # Remove year in parentheses (searched separately)
+    title = re.sub(r'\(\d{4}\)', ' ', title)
+    # Remove common torrent/release junk
+    title = re.sub(r'(?i)\b(bluray|bdrip|dvdrip|webrip|web-dl|hdtv|hdrip|x264|x265|h264|h265|'
+                   r'aac|ac3|dts|720p|1080p|2160p|4k|remux|remastered|extended|uncut)\b', ' ', title)
+    # Remove special characters but keep apostrophes and hyphens within words
+    title = re.sub(r"[^a-zA-Z0-9'\-\s]", ' ', title)
+    # Collapse whitespace
+    title = ' '.join(title.split()).strip()
+    # If nothing useful remains, return empty
+    if len(title) < 2:
+        return ""
+    return title
+
+
+def _validate_imdb_id(imdb_id):
+    """Return imdb_id if it looks valid (tt followed by digits), else None."""
+    if not imdb_id:
+        return None
+    if not re.match(r'^tt\d+$', imdb_id):
+        return None
+    return imdb_id
+
+
 def _subtitle_search(api_key, token, imdb_id=None, title=None, year=None, lang="en"):
-    """Search OpenSubtitles API. Returns list of subtitle dicts."""
+    """Search OpenSubtitles API. Returns list of subtitle dicts with match validation.
+
+    When searching by title (no IMDb ID), validates that the returned feature
+    matches our year to avoid downloading subtitles for the wrong movie.
+    """
     import requests
     headers = {
         "Api-Key": api_key,
@@ -897,12 +943,22 @@ def _subtitle_search(api_key, token, imdb_id=None, title=None, year=None, lang="
         "User-Agent": "plex-strm/1.0",
     }
     params = {"languages": lang}
+    searched_by = None
+
     if imdb_id:
         params["imdb_id"] = imdb_id.replace("tt", "")
+        searched_by = "imdb"
     elif title:
-        params["query"] = re.sub(r"\(\d{4}\)", "", title).strip()
+        clean = _clean_title_for_search(title)
+        if not clean:
+            log.debug("OpenSubtitles: title '%s' cleaned to empty, skipping", title)
+            return []
+        params["query"] = clean
         if year:
             params["year"] = str(year)
+        searched_by = "title"
+    else:
+        return []
 
     resp = requests.get("https://api.opensubtitles.com/api/v1/subtitles",
                         headers=headers, params=params, timeout=30)
@@ -914,12 +970,28 @@ def _subtitle_search(api_key, token, imdb_id=None, title=None, year=None, lang="
     for item in resp.json().get("data", []):
         attrs = item.get("attributes", {})
         files = attrs.get("files", [])
-        if files:
-            results.append({
-                "id": str(files[0].get("file_id", "")),
-                "name": attrs.get("release", "subtitle.srt"),
-                "downloads": attrs.get("download_count", 0),
-            })
+        if not files:
+            continue
+
+        # Extract feature details for validation
+        feat = attrs.get("feature_details", {})
+        feat_year = feat.get("year")
+        feat_imdb = feat.get("imdb_id")
+
+        # Validate match when searching by title — year must match within ±1
+        if searched_by == "title" and year and feat_year:
+            if abs(int(feat_year) - int(year)) > 1:
+                continue  # Wrong movie, skip
+
+        results.append({
+            "id": str(files[0].get("file_id", "")),
+            "name": attrs.get("release", "subtitle.srt"),
+            "downloads": attrs.get("download_count", 0),
+            "feature_imdb": feat_imdb,
+            "feature_title": feat.get("title"),
+            "feature_year": feat_year,
+        })
+
     results.sort(key=lambda x: x["downloads"], reverse=True)
     return results
 
@@ -1145,6 +1217,9 @@ def download_subtitles(db, media_item_ids, mode="missing"):
         title = info["title"]
         safe_title = re.sub(r'[<>:"/\\|?*]', "_", title)
 
+        # Validate IMDb ID
+        imdb_id = _validate_imdb_id(info.get("imdb_id"))
+
         # In "missing" mode, check which subtitle languages already exist
         existing_langs = set()
         if mode == "missing":
@@ -1158,9 +1233,9 @@ def download_subtitles(db, media_item_ids, mode="missing"):
                 skipped += 1
                 continue
 
-            # Search
-            if info["imdb_id"]:
-                results = _subtitle_search(api_key, token, imdb_id=info["imdb_id"], lang=lang)
+            # Search — prefer IMDb ID (exact match), fall back to cleaned title
+            if imdb_id:
+                results = _subtitle_search(api_key, token, imdb_id=imdb_id, lang=lang)
             else:
                 results = _subtitle_search(api_key, token, title=title,
                                            year=info["year"], lang=lang)
