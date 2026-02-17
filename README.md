@@ -55,6 +55,37 @@ plex.example.com {
 
 This way both Plex and Zurg share the same domain. Clients requesting `/strm/*` hit Zurg directly, everything else goes to Plex.
 
+### Basic authentication
+
+Without protection, anyone who discovers your `/strm/*` endpoint can stream from your Real-Debrid account. Add basic auth in your reverse proxy and embed the credentials in the `--base-url`:
+
+```
+# Caddyfile with basic_auth
+plex.example.com {
+    handle /strm/* {
+        basic_auth {
+            # Generate hash: caddy hash-password --plaintext 'your-password'
+            myuser $2a$14$...hashed-password...
+        }
+        reverse_proxy localhost:9091
+    }
+    handle {
+        reverse_proxy localhost:32400
+    }
+}
+```
+
+Then pass credentials in the URL so Plex can authenticate:
+
+```bash
+plex-strm update --pg --protect \
+  --base-url https://myuser:mypassword@plex.example.com
+```
+
+This rewrites all STRM URLs to `https://myuser:mypassword@plex.example.com/strm/...`. Plex stores the full URL in the database and sends the credentials when streaming.
+
+> **Note:** Plex's built-in player (Lavf) does not send `Authorization` headers from the URL — it only works when credentials are embedded as `user:pass@host` in the URL itself. This is why `--base-url` includes the credentials rather than relying on header-based auth.
+
 ## Install
 
 ```bash
