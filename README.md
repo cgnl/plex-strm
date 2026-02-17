@@ -86,6 +86,17 @@ This rewrites all STRM URLs to `https://myuser:mypassword@plex.example.com/strm/
 
 > **Note:** Plex's built-in player (Lavf) does not send `Authorization` headers from the URL — it only works when credentials are embedded as `user:pass@host` in the URL itself. This is why `--base-url` includes the credentials rather than relying on header-based auth.
 
+## Project structure
+
+| File | Description |
+|------|-------------|
+| `plex_strm.py` | Entry point — CLI parsing, `update` command orchestration |
+| `db.py` | Database abstraction (SQLite + PostgreSQL), library helpers, backup |
+| `ffprobe.py` | FFprobe runner, stream parser, `media_items`/`media_streams` updates |
+| `zurg.py` | Zurgtorrent index, per-torrent repair, broken torrent cleanup |
+| `subtitles.py` | OpenSubtitles search/download/login, Plex DB registration |
+| `protect.py` | 4-layer trigger protection — install, drop, status, revert |
+
 ## Install
 
 ```bash
@@ -151,6 +162,8 @@ plex-strm update --pg --reanalyze 2 --workers 8
 | `--reanalyze N` | off | Re-probe items with ≤ N existing streams (useful for fixing incomplete metadata) |
 | `--zurg-url URL` | | Zurg base URL; triggers repair + retry on 5XX failures (e.g. `http://user:pass@localhost:9091`) |
 | `--zurg-data-dir DIR` | | Path to Zurg data directory (`.zurgtorrent` files). Enables per-torrent repair instead of repair-all |
+| `--cleanup-broken` | off | Delete fully broken+unfixable torrents from RealDebrid (requires `--zurg-data-dir` + `RD_API_TOKEN`) |
+| `--cleanup-broken-dry-run` | off | Show which broken torrents would be deleted without actually deleting |
 | `--backup-dir DIR` | `.` | Directory for SQLite database backups |
 
 ## Environment variables
@@ -185,6 +198,12 @@ plex-strm update --pg --reanalyze 2 --workers 8
 | `SUBTITLE_LANGS` | Comma-separated language codes (default: `en`) |
 | `SUBTITLE_DIR` | Directory for downloaded .srt files (default: `./subtitles`) |
 | `TMDB_API_KEY` | TMDB API key for TVDB→TMDB conversion ([get one here](https://www.themoviedb.org/settings/api)) |
+
+### Zurg / RealDebrid
+
+| Variable | Description |
+|----------|-------------|
+| `RD_API_TOKEN` | RealDebrid API token (required for `--cleanup-broken`) |
 
 ### URL rewriting
 
@@ -228,6 +247,24 @@ When `--zurg-url` is set, plex-strm automatically triggers Zurg's repair process
 - Retries all failed items after a global wait
 
 This recovers torrents that RealDebrid temporarily couldn't serve.
+
+### Broken torrent cleanup
+
+When `--cleanup-broken` is set (with `--zurg-data-dir` and `RD_API_TOKEN` env var), plex-strm scans all `.zurgtorrent` files and deletes torrents from RealDebrid that are:
+
+1. Marked **Unfixable** by Zurg (repair was already attempted and failed)
+2. **Fully broken** — every file in the torrent is in a broken/deleted state
+
+This cleans up dead weight in your RealDebrid account. Partially broken torrents (some files still work) are left untouched.
+
+```bash
+# Dry run first — see what would be deleted
+plex-strm update --pg --zurg-data-dir /path/to/zurg/data --cleanup-broken-dry-run
+
+# Actually delete
+export RD_API_TOKEN=your-rd-api-token
+plex-strm update --pg --zurg-data-dir /path/to/zurg/data --cleanup-broken
+```
 
 ## Subtitle download
 
@@ -283,9 +320,15 @@ export OPENSUB_USER=your-username
 export OPENSUB_PASS=your-password
 export SUBTITLE_LANGS=en
 
+# Optional: RealDebrid (for --cleanup-broken)
+export RD_API_TOKEN=your-rd-api-token
+
 python3 /path/to/plex_strm.py --pg \
   --library "My STRM Library" \
   update --protect --subtitles --subtitle-mode missing \
+  --zurg-url http://user:pass@localhost:9091 \
+  --zurg-data-dir /path/to/zurg/data \
+  --cleanup-broken \
   --base-url https://plex.example.com
 ```
 
