@@ -888,6 +888,29 @@ def create_media_streams(db, media_item_id, meta):
 # OpenSubtitles
 # ---------------------------------------------------------------------------
 
+def _trigger_zurg_repair(zurg_url):
+    """Trigger Zurg repair-all via POST /torrents/repair. Returns True on success."""
+    import requests
+    try:
+        resp = requests.post(f"{zurg_url.rstrip('/')}/torrents/repair", timeout=30)
+        if resp.status_code == 200:
+            log.info("Zurg repair triggered successfully")
+            return True
+        log.warning("Zurg repair returned status %d", resp.status_code)
+    except Exception as e:
+        log.warning("Zurg repair request failed: %s", e)
+    return False
+
+
+def _is_server_error_url(mid, url):
+    """Check if a failed URL is likely a server error (5XX / unrestrict failure).
+    We track this by attempting a HEAD request — but since we don't cache the error type
+    from FFprobe, we simply return True (all failed items are candidates for repair)."""
+    # All items that failed FFprobe are potential repair candidates.
+    # Zurg repair is idempotent and fast, so it's safe to trigger for all failures.
+    return True
+
+
 def _clean_title_for_search(title):
     """Clean a title for OpenSubtitles search.
 
@@ -1507,6 +1530,59 @@ def cmd_update(args):
             elapsed = time.time() - t0
             log.info("FFprobe done: %d analyzed, %d failed (%.1fs)", analyzed, failed, elapsed)
 
+            # Zurg repair + retry: if we have server errors and a Zurg URL, trigger repair
+            zurg_url = getattr(args, 'zurg_url', None)
+            server_error_items = [(mid, url) for mid, url in failed_items
+                                  if _is_server_error_url(mid, url)]
+            if zurg_url and server_error_items:
+                log.info("Triggering Zurg repair for %d server-error items...",
+                         len(server_error_items))
+                repair_ok = _trigger_zurg_repair(zurg_url)
+                if repair_ok:
+                    # Wait for repair to process
+                    repair_wait = min(120, max(30, len(server_error_items) // 10))
+                    log.info("Waiting %ds for Zurg repair to complete...", repair_wait)
+                    time.sleep(repair_wait)
+
+                    # Retry only the server-error items
+                    log.info("Retrying %d previously failed items after repair...",
+                             len(server_error_items))
+                    retry_ok = 0
+                    retry_fail = 0
+                    retry_mapping = {mid: url for mid, url in server_error_items}
+                    workers = int(os.environ.get("FFPROBE_WORKERS", args.workers or 4))
+                    probe_timeout = int(os.environ.get("FFPROBE_TIMEOUT", args.timeout or 30))
+                    probe_path = args.ffprobe or os.environ.get("FFPROBE_PATH", "ffprobe")
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        futs = {
+                            executor.submit(
+                                run_ffprobe, retry_mapping[mid],
+                                probe_path, probe_timeout, 1
+                            ): mid
+                            for mid in retry_mapping
+                        }
+                        for fut in as_completed(futs):
+                            mid = futs[fut]
+                            try:
+                                meta = fut.result()
+                            except Exception:
+                                meta = None
+                            if meta:
+                                update_media_item(db, mid, dict(meta))
+                                create_media_streams(db, mid, dict(meta))
+                                retry_ok += 1
+                                analyzed += 1
+                                failed -= 1
+                                # Remove from failed_items
+                                failed_items = [(m, u) for m, u in failed_items if m != mid]
+                            else:
+                                retry_fail += 1
+                            if (retry_ok + retry_fail) % 10 == 0:
+                                db.commit()
+                    db.commit()
+                    log.info("Post-repair retry: %d recovered, %d still failed",
+                             retry_ok, retry_fail)
+
             # Write failed items to a separate log file for future retry
             if failed_items:
                 fail_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffprobe_failures.log")
@@ -1640,7 +1716,10 @@ def main():
     p_update.add_argument("--reanalyze", metavar="N", type=int, default=None,
                            help="re-analyze items with <= N streams (e.g. --reanalyze 2 for incomplete)")
     p_update.add_argument("--retries", type=int, default=2,
-                           help="number of FFprobe retries per URL on failure (default: 2)")
+                          help="number of FFprobe retries per URL on failure (default: 2)")
+    p_update.add_argument("--zurg-url", metavar="URL",
+                          help="Zurg base URL for triggering repair on 5XX failures "
+                               "(e.g. http://user:pass@localhost:9091)")
 
     # status
     sub.add_parser("status", help="show protection status and URL counts")

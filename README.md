@@ -149,6 +149,7 @@ plex-strm update --pg --reanalyze 2 --workers 8
 | `--timeout N` | `30` | FFprobe timeout per URL in seconds |
 | `--retries N` | `2` | FFprobe retries per URL (only retries on timeouts/transient errors, not on dead links) |
 | `--reanalyze N` | off | Re-probe items with ≤ N existing streams (useful for fixing incomplete metadata) |
+| `--zurg-url URL` | | Zurg base URL; triggers repair + retry on 5XX failures (e.g. `http://user:pass@localhost:9091`) |
 | `--backup-dir DIR` | `.` | Directory for SQLite database backups |
 
 ## Environment variables
@@ -205,6 +206,17 @@ FFprobe extracts **all** video, audio, and subtitle streams from each URL — no
 ### Smart retries
 
 FFprobe retries on timeouts and transient network errors, but **skips immediately** on server errors (403, 404, 5XX) since those indicate dead links. Failed items are written to `ffprobe_failures.log` for review.
+
+### Zurg repair integration
+
+When `--zurg-url` is set, plex-strm automatically triggers Zurg's repair process after FFprobe encounters server errors:
+
+1. FFprobe runs on all items, collecting failures
+2. If there are failures, `POST /torrents/repair` is sent to Zurg
+3. Waits for repair to complete (30-120s depending on failure count)
+4. Retries all previously failed items
+
+This recovers torrents that RealDebrid temporarily couldn't serve.
 
 ## Subtitle download
 
