@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from db import connect_from_args, resolve_library_ids, library_join, backup_database
-from ffprobe import run_ffprobe, update_media_item, create_media_streams
+from ffprobe import run_ffprobe, update_media_item, update_media_part, create_media_streams
 from protect import (install_protection, backup_existing_urls,
                      cmd_protect, cmd_unprotect, cmd_status, cmd_revert)
 from subtitles import download_subtitles
@@ -24,6 +24,62 @@ from zurg import (build_zurgtorrent_index, extract_rd_id_from_url,
                   is_server_error_url, cleanup_broken_torrents)
 
 log = logging.getLogger("plex-strm")
+
+# Default Plex URL for triggering analyze after DB writes
+PLEX_URL = os.environ.get("PLEX_URL", "http://localhost:32400")
+PLEX_TOKEN = os.environ.get("PLEX_TOKEN", "")
+
+
+def _trigger_plex_analyze(db, media_item_ids, plex_url=None, plex_token=None):
+    """Trigger Plex's native analyze for items after DB writes.
+
+    Plex requires its own analyze pass to update internal caches/bundles
+    beyond the database. With metadata already in the DB, this is fast (~0.5s/item).
+    """
+    import requests
+
+    base = plex_url or PLEX_URL
+    token = plex_token or PLEX_TOKEN
+    if not token:
+        log.warning("No PLEX_TOKEN configured — skipping Plex analyze trigger. "
+                    "Items may not play until Plex analyzes them natively.")
+        return 0
+
+    # Look up metadata_item_ids (ratingKeys) for all media_item_ids
+    ph = "%s" if db.is_pg else "?"
+    cur = db.cursor()
+    placeholders = ", ".join(ph for _ in media_item_ids)
+    db.execute(cur,
+        f"SELECT id, metadata_item_id FROM media_items WHERE id IN ({placeholders})",
+        tuple(media_item_ids))
+    rows = db.fetchall(cur)
+    cur.close()
+
+    rating_keys = set()
+    for row in rows:
+        if row.get("metadata_item_id"):
+            rating_keys.add(row["metadata_item_id"])
+
+    if not rating_keys:
+        return 0
+
+    log.info("Triggering Plex analyze for %d items...", len(rating_keys))
+    triggered = 0
+    for rk in rating_keys:
+        try:
+            resp = requests.put(
+                f"{base}/library/metadata/{rk}/analyze",
+                params={"X-Plex-Token": token},
+                timeout=10)
+            if resp.status_code == 200:
+                triggered += 1
+            else:
+                log.debug("Plex analyze %d returned %d", rk, resp.status_code)
+        except Exception as e:
+            log.debug("Plex analyze %d failed: %s", rk, e)
+
+    log.info("Plex analyze triggered for %d/%d items", triggered, len(rating_keys))
+    return triggered
 
 
 def cmd_update(args):
@@ -170,6 +226,7 @@ def cmd_update(args):
             analyzed = 0
             failed = 0
             failed_items = []
+            analyzed_mids = []
             t0 = time.time()
 
             with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -187,8 +244,10 @@ def cmd_update(args):
 
                     if meta:
                         update_media_item(db, mid, dict(meta))
+                        update_media_part(db, mid, dict(meta), url_mapping.get(mid))
                         create_media_streams(db, mid, dict(meta))
                         analyzed += 1
+                        analyzed_mids.append(mid)
                     else:
                         failed += 1
                         failed_items.append((mid, url_mapping[mid]))
@@ -284,9 +343,11 @@ def cmd_update(args):
                                 meta = None
                             if meta:
                                 update_media_item(db, mid, dict(meta))
+                                update_media_part(db, mid, dict(meta), retry_mapping.get(mid))
                                 create_media_streams(db, mid, dict(meta))
                                 retry_ok += 1
                                 analyzed += 1
+                                analyzed_mids.append(mid)
                                 failed -= 1
                                 failed_items = [(m, u) for m, u in failed_items if m != mid]
                             else:
@@ -308,6 +369,16 @@ def cmd_update(args):
                         url_id = url.rsplit("/", 1)[-1] if "/" in url else url[-30:]
                         f.write(f"{mid}\t{url_id}\t{url}\n")
                 log.info("Failed items written to %s", fail_log)
+
+            # Trigger Plex native analyze so internal caches are updated
+            if analyzed_mids:
+                plex_token = getattr(args, 'plex_token', None) or PLEX_TOKEN
+                plex_url = getattr(args, 'plex_url', None) or PLEX_URL
+                if plex_token:
+                    _trigger_plex_analyze(db, analyzed_mids, plex_url, plex_token)
+                else:
+                    log.info("No --plex-token or PLEX_TOKEN set, skipping analyze trigger. "
+                             "Run 'Analyze' in Plex for items to become playable.")
 
             # Cleanup broken torrents
             cleanup = getattr(args, 'cleanup_broken', False)
@@ -388,6 +459,12 @@ def main():
                            help="Path to Zurg data directory containing .zurgtorrent files. "
                                 "Enables per-torrent repair instead of repair-all. "
                                 "(e.g. /Users/sander/bin/zurg/data)")
+    p_update.add_argument("--plex-url", metavar="URL",
+                          help="Plex server URL for triggering analyze after FFprobe "
+                               "(default: http://localhost:32400 or PLEX_URL env var)")
+    p_update.add_argument("--plex-token", metavar="TOKEN",
+                          help="Plex auth token for analyze trigger "
+                               "(default: PLEX_TOKEN env var)")
     p_update.add_argument("--cleanup-broken", action="store_true",
                            help="Delete fully broken+unfixable torrents from RealDebrid. "
                                 "Only removes torrents where Zurg confirmed repair is impossible "
