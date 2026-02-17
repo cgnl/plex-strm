@@ -997,24 +997,50 @@ def _get_metadata_for_subtitle(db, media_item_id):
     info = {"title": row["title"], "year": row["year"], "imdb_id": None,
             "metadata_item_id": mid, "media_item_id": media_item_id}
 
-    # Try guids table for IMDB
-    try:
-        if db.is_pg:
-            db.execute(cur,
-                "SELECT guid FROM guids WHERE metadata_item_id = %s AND guid LIKE 'imdb://%' LIMIT 1",
-                (mid,))
-        else:
-            db.execute(cur,
-                "SELECT guid FROM guids WHERE metadata_item_id = ? AND guid LIKE 'imdb://%' LIMIT 1",
-                (mid,))
-        grow = db.fetchone(cur)
-        if grow:
-            imdb = grow["guid"].replace("imdb://", "")
-            if not imdb.startswith("tt"):
-                imdb = "tt" + imdb
-            info["imdb_id"] = imdb
-    except Exception:
-        # guids table may not exist
+    # Try to find IMDb ID — different Plex versions store this differently.
+    # Each attempt uses a savepoint so a missing table won't abort the transaction.
+    ph = "%s" if db.is_pg else "?"
+    imdb_queries = [
+        # 1. tags + taggings (PostgreSQL / plex-postgresql)
+        (f"SELECT t.tag AS imdb_tag FROM taggings tg "
+         f"JOIN tags t ON tg.tag_id = t.id "
+         f"WHERE tg.metadata_item_id = {ph} AND t.tag LIKE 'imdb://%%' LIMIT 1"
+         if db.is_pg else
+         "SELECT t.tag AS imdb_tag FROM taggings tg "
+         "JOIN tags t ON tg.tag_id = t.id "
+         f"WHERE tg.metadata_item_id = {ph} AND t.tag LIKE 'imdb://%' LIMIT 1"),
+        # 2. guids table (newer Plex SQLite versions)
+        (f"SELECT guid AS imdb_tag FROM guids "
+         f"WHERE metadata_item_id = {ph} AND guid LIKE 'imdb://%%' LIMIT 1"
+         if db.is_pg else
+         f"SELECT guid AS imdb_tag FROM guids "
+         f"WHERE metadata_item_id = {ph} AND guid LIKE 'imdb://%' LIMIT 1"),
+    ]
+
+    for imdb_sql in imdb_queries:
+        if info["imdb_id"]:
+            break
+        try:
+            if db.is_pg:
+                db.execute(cur, "SAVEPOINT imdb_lookup")
+            db.execute(cur, imdb_sql, (mid,))
+            grow = db.fetchone(cur)
+            if grow and grow.get("imdb_tag"):
+                imdb = grow["imdb_tag"].replace("imdb://", "")
+                if not imdb.startswith("tt"):
+                    imdb = "tt" + imdb
+                info["imdb_id"] = imdb
+            if db.is_pg:
+                db.execute(cur, "RELEASE SAVEPOINT imdb_lookup")
+        except Exception:
+            if db.is_pg:
+                try:
+                    db.execute(cur, "ROLLBACK TO SAVEPOINT imdb_lookup")
+                except Exception:
+                    pass
+
+    # Fallback: parse guid column on metadata_items directly
+    if not info["imdb_id"]:
         match = re.search(r"(tt\d+)", row.get("guid", ""))
         if match:
             info["imdb_id"] = match.group(1)
