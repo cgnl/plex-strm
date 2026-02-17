@@ -182,6 +182,7 @@ plex-strm update --pg --reanalyze 2 --workers 8
 | `OPENSUB_PASS` | OpenSubtitles password |
 | `SUBTITLE_LANGS` | Comma-separated language codes (default: `en`) |
 | `SUBTITLE_DIR` | Directory for downloaded .srt files (default: `./subtitles`) |
+| `TMDB_API_KEY` | TMDB API key for TVDB→TMDB conversion ([get one here](https://www.themoviedb.org/settings/api)) |
 
 ### URL rewriting
 
@@ -209,7 +210,7 @@ FFprobe retries on timeouts and transient network errors, but **skips immediatel
 
 When `--subtitles` is enabled, plex-strm searches OpenSubtitles.com for each processed media item:
 
-1. Searches by IMDb ID (most accurate) or falls back to title + year
+1. Searches by IMDb ID > TMDB ID > TVDB ID (auto-converted to TMDB) > title + year
 2. Downloads the most popular `.srt` file for each configured language
 3. Registers the subtitle as a `media_streams` entry (stream_type_id=3) in the Plex database
 

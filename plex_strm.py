@@ -1129,8 +1129,39 @@ def _get_metadata_for_subtitle(db, media_item_id):
         if match:
             info["imdb_id"] = match.group(1)
 
+    # Convert TVDB -> TMDB via TMDB API when we have no IMDb and no TMDB
+    if not info["imdb_id"] and not info["tmdb_id"] and info["tvdb_id"]:
+        tmdb_api_key = os.environ.get("TMDB_API_KEY")
+        if tmdb_api_key:
+            converted = _tvdb_to_tmdb(info["tvdb_id"], tmdb_api_key)
+            if converted:
+                info["tmdb_id"] = converted
+
     cur.close()
     return info
+
+
+def _tvdb_to_tmdb(tvdb_id, tmdb_api_key):
+    """Convert a TVDB ID to a TMDB ID via the TMDB API. Returns TMDB ID string or None."""
+    import requests
+    # Try TV show first (most TVDB IDs are shows)
+    for media_type in ("tv", "movie"):
+        try:
+            resp = requests.get(
+                f"https://api.themoviedb.org/3/find/{tvdb_id}",
+                params={"api_key": tmdb_api_key, "external_source": "tvdb_id"},
+                timeout=10)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            results = data.get(f"{media_type}_results", [])
+            if results:
+                tmdb_id = str(results[0]["id"])
+                log.debug("TVDB %s -> TMDB %s (%s)", tvdb_id, tmdb_id, media_type)
+                return tmdb_id
+        except Exception:
+            pass
+    return None
 
 
 def _get_existing_subtitle_langs(db, media_item_id):

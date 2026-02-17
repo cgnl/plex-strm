@@ -26,6 +26,7 @@ services:
       # OPENSUB_API_KEY: ""
       # OPENSUB_USER: ""
       # OPENSUB_PASS: ""
+      # TMDB_API_KEY: ""  # Optional: for TVDB->TMDB ID conversion
       SUBTITLE_LANGS: en
       SUBTITLE_DIR: /subtitles
     command: ["update", "--pg", "--protect", "--subtitles", "--subtitle-mode", "missing"]
