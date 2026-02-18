@@ -10,30 +10,67 @@ import time
 log = logging.getLogger("plex-strm")
 
 
-class TokenBucket:
-    """Simple token bucket rate limiter (thread-safe).
+class AdaptiveRateLimiter:
+    """Adaptive rate limiter that tracks actual throughput (thread-safe).
 
-    Allows up to `rate` requests per second with bursts up to `burst`.
-    Call acquire() before each request — it blocks until a token is available.
+    Starts conservatively (2 concurrent) and ramps up based on measured
+    success rate. If failures spike, it backs off. This prevents
+    thundering-herd on startup while reaching full throughput quickly.
     """
 
-    def __init__(self, rate_per_sec, burst=None):
-        self.rate = rate_per_sec
-        self.burst = burst or max(1, int(rate_per_sec / 2))
-        self.tokens = float(self.burst)
-        self.last = time.monotonic()
+    def __init__(self, workers, window=30):
+        self.max_workers = workers
+        self.window = window
         self.lock = threading.Lock()
+        # Start slow: 2 tokens, ramp up as successes come in
+        self._tokens = 2.0
+        self._rate = 2.0
+        self._last = time.monotonic()
+        # Track success/failure in sliding window
+        self._results = []  # (timestamp, success_bool)
+
+    @property
+    def rate(self):
+        return self._rate
+
+    def complete(self, success=True):
+        """Call after each request completes. Adapts rate based on success ratio."""
+        now = time.monotonic()
+        with self.lock:
+            self._results.append((now, success))
+            # Trim to window
+            cutoff = now - self.window
+            self._results = [(t, s) for t, s in self._results if t > cutoff]
+
+            if len(self._results) >= 5:
+                elapsed = now - self._results[0][0]
+                successes = sum(1 for _, s in self._results if s)
+                total = len(self._results)
+                success_ratio = successes / total if total else 1.0
+                throughput = total / elapsed if elapsed > 0 else 1.0
+
+                if success_ratio > 0.85:
+                    # Healthy: ramp up toward max workers
+                    self._rate = min(self.max_workers, throughput * 1.2)
+                elif success_ratio > 0.5:
+                    # Some failures: hold steady
+                    self._rate = max(1.0, throughput * 0.9)
+                else:
+                    # Many failures: back off hard
+                    self._rate = max(1.0, throughput * 0.5)
 
     def acquire(self):
+        """Block until a token is available."""
         while True:
             with self.lock:
                 now = time.monotonic()
-                self.tokens = min(self.burst, self.tokens + (now - self.last) * self.rate)
-                self.last = now
-                if self.tokens >= 1.0:
-                    self.tokens -= 1.0
+                elapsed = now - self._last
+                self._tokens = min(self.max_workers, self._tokens + elapsed * self._rate)
+                self._last = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
                     return
-            time.sleep(0.05)  # 50ms poll
+            time.sleep(0.05)
 
 # FFprobe codec name -> Plex codec name
 CODEC_MAP = {
@@ -114,7 +151,8 @@ def run_ffprobe(url, ffprobe_path="ffprobe", timeout=30, retries=2, rate_limiter
     """Run ffprobe on a URL and return parsed metadata dict, or None on failure.
 
     Retries up to `retries` times on timeout or transient errors.
-    If rate_limiter (TokenBucket) is provided, acquires a token before each attempt.
+    If rate_limiter (AdaptiveRateLimiter) is provided, acquires a token before each
+    attempt and signals completion after.
     """
     cmd = [ffprobe_path, "-v", "error",
            "-probesize", "128000", "-analyzeduration", "500000",
@@ -125,6 +163,8 @@ def run_ffprobe(url, ffprobe_path="ffprobe", timeout=30, retries=2, rate_limiter
 
     # Errors that mean the link is permanently dead — no point retrying
     _permanent_errors = ("403", "404", "410", "forbidden", "not found", "gone")
+
+    _complete = rate_limiter.complete if rate_limiter else lambda success=True: None
 
     for attempt in range(1 + retries):
         if rate_limiter:
@@ -139,9 +179,11 @@ def run_ffprobe(url, ffprobe_path="ffprobe", timeout=30, retries=2, rate_limiter
 
                 # Permanent errors: don't retry
                 if any(x in stderr_low for x in _permanent_errors):
+                    _complete(success=False)
                     log.warning("FFprobe FAILED [%s]: %s", url_id, last_error)
                     return None
 
+                _complete(success=False)
                 # 5XX / transient: retry with exponential backoff
                 if attempt < retries:
                     backoff = 2 ** attempt  # 1s, 2s, 4s
@@ -151,11 +193,13 @@ def run_ffprobe(url, ffprobe_path="ffprobe", timeout=30, retries=2, rate_limiter
                     continue
                 log.warning("FFprobe FAILED after %d attempts [%s]: %s", attempt + 1, url_id, last_error)
                 return None
+            _complete(success=True)
             data = json.loads(result.stdout)
             if attempt > 0:
                 log.info("FFprobe succeeded on retry %d [%s]", attempt, url_id)
             return _parse_ffprobe(data)
         except subprocess.TimeoutExpired:
+            _complete(success=False)
             last_error = f"timeout ({timeout}s)"
             if attempt < retries:
                 time.sleep(2 ** attempt)
