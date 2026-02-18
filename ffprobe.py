@@ -11,53 +11,36 @@ log = logging.getLogger("plex-strm")
 
 
 class AdaptiveRateLimiter:
-    """Adaptive rate limiter that tracks actual throughput (thread-safe).
+    """Adaptive rate limiter that ramps up from slow start (thread-safe).
 
-    Starts conservatively (2 concurrent) and ramps up based on measured
-    success rate. If failures spike, it backs off. This prevents
-    thundering-herd on startup while reaching full throughput quickly.
+    Starts with 2 concurrent slots and adds 1 slot per `ramp_interval`
+    completions until reaching `workers`. This avoids thundering-herd
+    on startup while quickly reaching full throughput.
     """
 
-    def __init__(self, workers, window=30):
+    def __init__(self, workers, ramp_interval=10):
         self.max_workers = workers
-        self.window = window
+        self.ramp_interval = ramp_interval
         self.lock = threading.Lock()
-        # Start slow: 2 tokens, ramp up as successes come in
-        self._tokens = 2.0
-        self._rate = 2.0
+        self._tokens = 2.0  # start with 2 in-flight
+        self._max_tokens = 2.0  # current ceiling (ramps up)
+        self._completions = 0
         self._last = time.monotonic()
-        # Track success/failure in sliding window
-        self._results = []  # (timestamp, success_bool)
+        # Refill at workers/s — fast enough that tokens aren't the bottleneck
+        self._rate = float(workers)
 
     @property
     def rate(self):
         return self._rate
 
     def complete(self, success=True):
-        """Call after each request completes. Adapts rate based on success ratio."""
-        now = time.monotonic()
+        """Call after each request. Ramps up max concurrency on completions."""
         with self.lock:
-            self._results.append((now, success))
-            # Trim to window
-            cutoff = now - self.window
-            self._results = [(t, s) for t, s in self._results if t > cutoff]
-
-            if len(self._results) >= 5:
-                elapsed = now - self._results[0][0]
-                successes = sum(1 for _, s in self._results if s)
-                total = len(self._results)
-                success_ratio = successes / total if total else 1.0
-                throughput = total / elapsed if elapsed > 0 else 1.0
-
-                if success_ratio > 0.85:
-                    # Healthy: ramp up toward max workers
-                    self._rate = min(self.max_workers, throughput * 1.2)
-                elif success_ratio > 0.5:
-                    # Some failures: hold steady
-                    self._rate = max(1.0, throughput * 0.9)
-                else:
-                    # Many failures: back off hard
-                    self._rate = max(1.0, throughput * 0.5)
+            self._completions += 1
+            # Every ramp_interval completions, increase ceiling by 1
+            if self._max_tokens < self.max_workers:
+                new_max = min(self.max_workers, 2.0 + self._completions / self.ramp_interval)
+                self._max_tokens = new_max
 
     def acquire(self):
         """Block until a token is available."""
@@ -65,7 +48,7 @@ class AdaptiveRateLimiter:
             with self.lock:
                 now = time.monotonic()
                 elapsed = now - self._last
-                self._tokens = min(self.max_workers, self._tokens + elapsed * self._rate)
+                self._tokens = min(self._max_tokens, self._tokens + elapsed * self._rate)
                 self._last = now
                 if self._tokens >= 1.0:
                     self._tokens -= 1.0
