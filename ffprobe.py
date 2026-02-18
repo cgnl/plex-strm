@@ -327,11 +327,9 @@ def update_media_item(db, media_item_id, meta):
 def update_media_part(db, media_item_id, meta, strm_url=None):
     """UPDATE media_parts with real file size and extra_data.
 
-    Gets real file size via HEAD request following the Zurg redirect to RealDebrid.
+    Uses file size from FFprobe format output (no extra HEAD request needed).
     Builds Plex-compatible extra_data with container, videoProfile, and chapters.
     """
-    import requests
-
     ph = "%s" if db.is_pg else "?"
 
     # Get the media_part ID
@@ -343,19 +341,9 @@ def update_media_part(db, media_item_id, meta, strm_url=None):
         cur.close()
         return
     part_id = row[0]
-    file_url = strm_url or row[1]
 
-    # Get real file size via HEAD request
-    real_size = None
-    if file_url and file_url.startswith("http"):
-        try:
-            # Follow redirect to RealDebrid and get Content-Length
-            resp = requests.head(file_url, allow_redirects=True, timeout=15)
-            cl = resp.headers.get("Content-Length")
-            if cl:
-                real_size = int(cl)
-        except Exception:
-            pass
+    # Use file size from FFprobe (already parsed from format.size)
+    real_size = meta.get("size")
 
     # Build extra_data for media_parts
     container = meta.get("container", "mkv")
