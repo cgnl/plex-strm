@@ -96,19 +96,29 @@ def run_ffprobe(url, ffprobe_path="ffprobe", timeout=30, retries=2):
     url_id = url.rsplit("/", 1)[-1] if "/" in url else url[-30:]
     last_error = None
 
+    # Errors that mean the link is permanently dead — no point retrying
+    _permanent_errors = ("403", "404", "410", "forbidden", "not found", "gone")
+
     for attempt in range(1 + retries):
         try:
             result = subprocess.run(cmd, capture_output=True, text=True,
-                                    encoding="utf-8", errors="ignore", timeout=timeout)
+                                     encoding="utf-8", errors="ignore", timeout=timeout)
             if result.returncode != 0:
                 stderr_snip = (result.stderr or "")[:300].strip()
                 last_error = f"exit code {result.returncode}: {stderr_snip}"
-                if any(x in stderr_snip.lower() for x in ("server error", "server returned",
-                        "403", "404", "410", "5xx", "forbidden", "not found")):
+                stderr_low = stderr_snip.lower()
+
+                # Permanent errors: don't retry
+                if any(x in stderr_low for x in _permanent_errors):
                     log.warning("FFprobe FAILED [%s]: %s", url_id, last_error)
                     return None
+
+                # 5XX / transient: retry with exponential backoff
                 if attempt < retries:
-                    time.sleep(1 * (attempt + 1))
+                    backoff = 2 ** attempt  # 1s, 2s, 4s
+                    log.debug("FFprobe retry %d/%d [%s] in %ds: %s",
+                              attempt + 1, retries, url_id, backoff, last_error)
+                    time.sleep(backoff)
                     continue
                 log.warning("FFprobe FAILED after %d attempts [%s]: %s", attempt + 1, url_id, last_error)
                 return None
@@ -119,7 +129,7 @@ def run_ffprobe(url, ffprobe_path="ffprobe", timeout=30, retries=2):
         except subprocess.TimeoutExpired:
             last_error = f"timeout ({timeout}s)"
             if attempt < retries:
-                time.sleep(1 * (attempt + 1))
+                time.sleep(2 ** attempt)
                 continue
             log.warning("FFprobe FAILED after %d attempts [%s]: %s", attempt + 1, url_id, last_error)
             return None
