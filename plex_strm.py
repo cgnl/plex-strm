@@ -279,6 +279,24 @@ def cmd_update(args):
             # based on success ratio, backs off on failures.
             rl = AdaptiveRateLimiter(workers=workers)
             total_items = len(url_mapping)
+
+            # Rewrite URLs to hit Zurg directly (skip Caddy/proxy chain)
+            # DB URLs: https://user:pass@plex.dtun.nl/strm/X → http://user:pass@localhost:9091/strm/X
+            ffprobe_mapping = {}
+            base_url = getattr(args, 'base_url', None) or os.environ.get("STRM_BASE_URL")
+            if zurg_url and base_url:
+                from urllib.parse import urlparse
+                pub = urlparse(base_url)
+                local = urlparse(zurg_url)
+                pub_origin = f"{pub.scheme}://{pub.netloc}"
+                local_origin = f"{local.scheme}://{local.netloc}"
+                for mid, url in url_mapping.items():
+                    ffprobe_mapping[mid] = url.replace(pub_origin, local_origin, 1)
+                log.info("FFprobe URLs rewritten to direct Zurg (%s → %s)",
+                         pub_origin, local_origin)
+            else:
+                ffprobe_mapping = dict(url_mapping)
+
             log.info("Running FFprobe analysis on %d URLs (%d workers, %d retries)...",
                      total_items, workers, retries)
 
@@ -289,7 +307,7 @@ def cmd_update(args):
             t0 = time.time()
 
             # Process in passes: failures go back in queue for next pass
-            queue = list(url_mapping.items())  # [(mid, url), ...]
+            queue = list(ffprobe_mapping.items())  # [(mid, ffprobe_url), ...]
 
             for pass_num in range(1 + retries):
                 if not queue:
@@ -317,7 +335,7 @@ def cmd_update(args):
 
                         if meta:
                             update_media_item(db, mid, dict(meta))
-                            update_media_part(db, mid, dict(meta), url)
+                            update_media_part(db, mid, dict(meta))
                             create_media_streams(db, mid, dict(meta))
                             analyzed += 1
                             analyzed_mids.append(mid)
@@ -325,7 +343,8 @@ def cmd_update(args):
                             retry_queue.append((mid, url))
                         else:
                             failed += 1
-                            failed_items.append((mid, url))
+                            # Store original DB URL for post-repair
+                            failed_items.append((mid, url_mapping.get(mid, url)))
 
                         done = analyzed + failed + len(retry_queue)
                         if done % 10 == 0:
