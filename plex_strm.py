@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from db import connect_from_args, resolve_library_ids, library_join, backup_database
-from ffprobe import run_ffprobe, update_media_item, update_media_part, create_media_streams
+from ffprobe import run_ffprobe, update_media_item, update_media_part, create_media_streams, TokenBucket
 from protect import (install_protection, backup_existing_urls,
                      cmd_protect, cmd_unprotect, cmd_status, cmd_revert)
 from subtitles import download_subtitles
@@ -275,8 +275,11 @@ def cmd_update(args):
                                      len(repaired), len(hashes_to_repair), wait)
                             time.sleep(wait)
 
-            log.info("Running FFprobe analysis on %d URLs (%d workers, %d retries)...",
-                     len(url_mapping), workers, retries)
+            # Rate limiter: ~4 req/s with burst matching worker count.
+            # Prevents overwhelming Zurg/RD while allowing high concurrency.
+            rl = TokenBucket(rate_per_sec=4, burst=workers)
+            log.info("Running FFprobe analysis on %d URLs (%d workers, %d retries, %.0f req/s)...",
+                     len(url_mapping), workers, retries, rl.rate)
 
             analyzed = 0
             failed = 0
@@ -286,7 +289,7 @@ def cmd_update(args):
 
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {
-                    executor.submit(run_ffprobe, url, ffprobe_path, timeout, retries): mid
+                    executor.submit(run_ffprobe, url, ffprobe_path, timeout, retries, rl): mid
                     for mid, url in url_mapping.items()
                 }
                 for future in as_completed(futures):
@@ -388,7 +391,7 @@ def cmd_update(args):
                         futs = {
                             executor.submit(
                                 run_ffprobe, retry_mapping[mid],
-                                ffprobe_path, timeout, 1
+                                ffprobe_path, timeout, 1, rl
                             ): mid
                             for mid in retry_mapping
                         }
@@ -521,8 +524,8 @@ def main():
                           help="missing = only download if language not yet in DB (default), "
                                "always = download even if subtitle track already exists")
     p_update.add_argument("--ffprobe", metavar="PATH", help="path to ffprobe binary")
-    p_update.add_argument("--workers", type=int, default=4,
-                          help="FFprobe parallel workers (default: 4)")
+    p_update.add_argument("--workers", type=int, default=16,
+                          help="FFprobe parallel workers (default: 16)")
     p_update.add_argument("--timeout", type=int, default=30,
                           help="FFprobe timeout per URL in seconds (default: 30)")
     p_update.add_argument("--backup-dir", metavar="DIR",

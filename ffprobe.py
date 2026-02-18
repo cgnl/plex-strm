@@ -4,9 +4,36 @@ import json
 import logging
 import os
 import subprocess
+import threading
 import time
 
 log = logging.getLogger("plex-strm")
+
+
+class TokenBucket:
+    """Simple token bucket rate limiter (thread-safe).
+
+    Allows up to `rate` requests per second with bursts up to `burst`.
+    Call acquire() before each request — it blocks until a token is available.
+    """
+
+    def __init__(self, rate_per_sec, burst=None):
+        self.rate = rate_per_sec
+        self.burst = burst or max(1, int(rate_per_sec / 2))
+        self.tokens = float(self.burst)
+        self.last = time.monotonic()
+        self.lock = threading.Lock()
+
+    def acquire(self):
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                self.tokens = min(self.burst, self.tokens + (now - self.last) * self.rate)
+                self.last = now
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
+            time.sleep(0.05)  # 50ms poll
 
 # FFprobe codec name -> Plex codec name
 CODEC_MAP = {
@@ -83,11 +110,11 @@ def _normalize_audio_profile(profile_str):
     return None
 
 
-def run_ffprobe(url, ffprobe_path="ffprobe", timeout=30, retries=2):
+def run_ffprobe(url, ffprobe_path="ffprobe", timeout=30, retries=2, rate_limiter=None):
     """Run ffprobe on a URL and return parsed metadata dict, or None on failure.
 
     Retries up to `retries` times on timeout or transient errors.
-    Does NOT retry on server errors (5XX, 4XX) — those are dead links.
+    If rate_limiter (TokenBucket) is provided, acquires a token before each attempt.
     """
     cmd = [ffprobe_path, "-v", "error",
            "-probesize", "128000", "-analyzeduration", "500000",
@@ -100,6 +127,8 @@ def run_ffprobe(url, ffprobe_path="ffprobe", timeout=30, retries=2):
     _permanent_errors = ("403", "404", "410", "forbidden", "not found", "gone")
 
     for attempt in range(1 + retries):
+        if rate_limiter:
+            rate_limiter.acquire()
         try:
             result = subprocess.run(cmd, capture_output=True, text=True,
                                      encoding="utf-8", errors="ignore", timeout=timeout)
