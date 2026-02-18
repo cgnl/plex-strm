@@ -133,23 +133,16 @@ def _normalize_audio_profile(profile_str):
 def _warm_cache(url, timeout=12):
     """Pre-warm Zurg's RD redirect cache with a tiny range request.
 
-    Returns True if the URL is reachable (2XX), False otherwise.
+    Returns True if the URL is reachable (2XX/206), False otherwise.
     This triggers Zurg's RD API call so subsequent FFprobe requests
     hit the cached redirect and complete in <1s instead of ~10s.
     """
-    import urllib.request
-    url_id = url.rsplit("/", 1)[-1] if "/" in url else url[-30:]
     try:
-        req = urllib.request.Request(url, method="GET")
-        req.add_header("Range", "bytes=0-0")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            resp.read(1)
-            return True
-    except urllib.error.HTTPError as e:
-        if e.code == 206:
-            return True
-        log.debug("Warm-cache %s: HTTP %d", url_id, e.code)
-        return False
+        import requests as _req
+        resp = _req.get(url, headers={"Range": "bytes=0-0"},
+                        timeout=timeout, stream=True, allow_redirects=True)
+        resp.close()
+        return resp.status_code in (200, 206)
     except Exception:
         return False
 
@@ -168,12 +161,6 @@ def run_ffprobe(url, ffprobe_path="ffprobe", timeout=30, retries=0, rate_limiter
     """
     url_id = url.rsplit("/", 1)[-1] if "/" in url else url[-30:]
 
-    # Step 1: warm Zurg cache — if this fails, skip FFprobe entirely
-    if not _warm_cache(url, timeout=min(12, timeout)):
-        log.debug("Warm-cache failed [%s], queuing for retry", url_id)
-        return None, True
-
-    # Step 2: FFprobe with warm cache — should complete in <1s
     cmd = [ffprobe_path, "-v", "error",
            "-probesize", "128000", "-analyzeduration", "500000",
            "-print_format", "json",
@@ -341,7 +328,12 @@ def _parse_ffprobe(data):
 
 
 def _build_extra_data(meta):
-    """Build Plex-format extra_data JSON from metadata."""
+    """Build Plex-format extra_data JSON for media_items.
+
+    Only includes ma:videoProfile and ma:audioProfile — NOT ma:width/ma:height
+    because those have their own columns in media_items and Plex generates
+    duplicate XML attributes if they appear in both column and extra_data.
+    """
     extra = {}
     url_parts = []
     if "video_profile" in meta:
@@ -350,12 +342,6 @@ def _build_extra_data(meta):
     if "audio_profile" in meta:
         extra["ma:audioProfile"] = meta["audio_profile"]
         url_parts.append(f"ma%3AaudioProfile={meta['audio_profile']}")
-    if "height" in meta:
-        extra["ma:height"] = str(meta["height"])
-        url_parts.append(f"ma%3Aheight={meta['height']}")
-    if "width" in meta:
-        extra["ma:width"] = str(meta["width"])
-        url_parts.append(f"ma%3Awidth={meta['width']}")
     if url_parts:
         extra["url"] = "&".join(url_parts)
     return json.dumps(extra) if extra else None
@@ -442,13 +428,15 @@ def update_media_part(db, media_item_id, meta, strm_url=None):
         extra["ma:videoProfile"] = video_profile
         url_parts.append(f"ma%3AvideoProfile={video_profile}")
 
-    # Chapters
+    # Chapters — always include (Plex expects it, even if empty)
     chapters = meta.get("_chapters")
     if chapters:
         ch_json = json.dumps({"Chapters": {"Chapter": chapters}})
-        extra["pv:chapters"] = ch_json
-        from urllib.parse import quote
-        url_parts.append(f"pv%3Achapters={quote(ch_json, safe='')}")
+    else:
+        ch_json = json.dumps({"Chapters": {}})
+    extra["pv:chapters"] = ch_json
+    from urllib.parse import quote
+    url_parts.append(f"pv%3Achapters={quote(ch_json, safe='')}")
 
     if url_parts:
         extra["url"] = "&".join(url_parts)
@@ -459,6 +447,9 @@ def update_media_part(db, media_item_id, meta, strm_url=None):
     updates = {}
     if real_size and real_size > 1000:
         updates["size"] = real_size
+    duration = meta.get("duration")
+    if duration and duration > 0:
+        updates["duration"] = duration
     if extra_data:
         updates["extra_data"] = extra_data
 
@@ -546,14 +537,15 @@ def create_media_streams(db, media_item_id, meta):
             plex_profile = profile
         if plex_profile:
             extra_parts["ma:profile"] = plex_profile
-            extra_parts["ma:videoProfile"] = plex_profile
+            # Note: Plex native analyzer only puts ma:profile in stream extra_data,
+            # NOT ma:videoProfile (that goes in media_items.extra_data only)
 
         # Rich metadata matching Plex analyze
         rfr = vs.get("r_frame_rate", "")
         if "/" in rfr:
             try:
                 n, d = rfr.split("/")
-                extra_parts["ma:frameRate"] = str(round(float(n) / float(d), 3))
+                extra_parts["ma:frameRate"] = "{:.3f}".format(float(n) / float(d))
             except (ValueError, ZeroDivisionError):
                 pass
 
@@ -641,9 +633,10 @@ def create_media_streams(db, media_item_id, meta):
         extra_parts = {}
         if plex_profile:
             extra_parts["ma:profile"] = plex_profile
-            extra_parts["ma:audioProfile"] = plex_profile
-        if channels:
-            extra_parts["ma:channels"] = str(channels)
+            # Note: Plex native analyzer only puts ma:profile in stream extra_data,
+            # NOT ma:audioProfile (that goes in media_items.extra_data only)
+        # Note: channels goes in DB column only, NOT in extra_data
+        # (Plex combines both into XML attributes — duplicates cause XML parse errors)
 
         # Rich audio metadata
         channel_layout = aus.get("channel_layout")

@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from db import connect_from_args, resolve_library_ids, library_join, backup_database
-from ffprobe import run_ffprobe, update_media_item, update_media_part, create_media_streams, AdaptiveRateLimiter
+from ffprobe import run_ffprobe, update_media_item, update_media_part, create_media_streams, _warm_cache
 from protect import (install_protection, backup_existing_urls,
                      cmd_protect, cmd_unprotect, cmd_status, cmd_revert)
 from subtitles import download_subtitles
@@ -33,17 +33,21 @@ PLEX_TOKEN = os.environ.get("PLEX_TOKEN", "")
 
 
 def _trigger_plex_analyze(db, media_item_ids, plex_url=None, plex_token=None):
-    """Trigger Plex's native analyze for items after DB writes.
+    """Flush Plex metadata cache for items after DB writes.
 
-    Plex requires its own analyze pass to update internal caches/bundles
-    beyond the database. With metadata already in the DB, this is fast (~0.5s/item).
+    Since we write correct media_items, media_parts, and media_streams data
+    directly to the DB (with media_analysis_version=6), we only need to tell
+    Plex to reload its in-memory cache — no full analyze needed.
+
+    This is ~1000x faster than PUT /library/metadata/{rk}/analyze, which
+    spawns FFmpeg + Plex Media Scanner per item.
     """
     import requests
 
     base = plex_url or PLEX_URL
     token = plex_token or PLEX_TOKEN
     if not token:
-        log.warning("No PLEX_TOKEN configured — skipping Plex analyze trigger. "
+        log.warning("No PLEX_TOKEN configured — skipping Plex cache flush. "
                     "Items may not play until Plex analyzes them natively.")
         return 0
 
@@ -65,23 +69,34 @@ def _trigger_plex_analyze(db, media_item_ids, plex_url=None, plex_token=None):
     if not rating_keys:
         return 0
 
-    log.info("Triggering Plex analyze for %d items...", len(rating_keys))
-    triggered = 0
+    log.info("Flushing Plex metadata cache for %d items...", len(rating_keys))
+    flushed = 0
+    errors = 0
+    session = requests.Session()
     for rk in rating_keys:
         try:
-            resp = requests.put(
-                f"{base}/library/metadata/{rk}/analyze",
-                params={"X-Plex-Token": token},
-                timeout=10)
+            resp = session.get(
+                f"{base}/:/metadata/flushMetadataCounterCache",
+                params={"metadataItemID": rk, "X-Plex-Token": token},
+                timeout=5)
             if resp.status_code == 200:
-                triggered += 1
+                flushed += 1
             else:
-                log.debug("Plex analyze %d returned %d", rk, resp.status_code)
+                errors += 1
+                if errors <= 5:
+                    log.warning("Plex cache flush %d returned %d", rk, resp.status_code)
         except Exception as e:
-            log.debug("Plex analyze %d failed: %s", rk, e)
+            errors += 1
+            if errors <= 5:
+                log.warning("Plex cache flush %d failed: %s", rk, e)
+        if (flushed + errors) % 1000 == 0:
+            log.info("Plex cache flush progress: %d/%d (%d errors)...",
+                     flushed, len(rating_keys), errors)
+    session.close()
 
-    log.info("Plex analyze triggered for %d/%d items", triggered, len(rating_keys))
-    return triggered
+    log.info("Plex cache flushed for %d/%d items (%d errors)",
+             flushed, len(rating_keys), errors)
+    return flushed
 
 
 LOCKFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".plex_strm.lock")
@@ -275,9 +290,6 @@ def cmd_update(args):
                                      len(repaired), len(hashes_to_repair), wait)
                             time.sleep(wait)
 
-            # Rate limiter disabled — workers are the concurrency limit,
-            # queue-based retries handle transient failures.
-            rl = None
             total_items = len(url_mapping)
 
             # Rewrite URLs to hit Zurg directly (skip Caddy/proxy chain)
@@ -309,6 +321,12 @@ def cmd_update(args):
             # Process in passes: failures go back in queue for next pass
             queue = list(ffprobe_mapping.items())  # [(mid, ffprobe_url), ...]
 
+            # Batched warm+FFprobe: warm a batch, immediately FFprobe it.
+            # Keeps RD API load manageable and ensures cache is hot for FFprobe.
+            WARM_BATCH = 100
+            WARM_WORKERS = 12
+            WARM_TIMEOUT = 30
+
             for pass_num in range(1 + retries):
                 if not queue:
                     break
@@ -319,47 +337,96 @@ def cmd_update(args):
                     time.sleep(wait)
 
                 retry_queue = []
+                total_in_pass = len(queue)
 
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    futures = {
-                        executor.submit(run_ffprobe, url, ffprobe_path, timeout, 0, rl): (mid, url)
-                        for mid, url in queue
-                    }
-                    for future in as_completed(futures):
-                        mid, url = futures[future]
-                        try:
-                            meta, retryable = future.result()
-                        except Exception as e:
-                            log.warning("FFprobe exception for media_item_id %d: %s", mid, e)
-                            meta, retryable = None, True
+                # Split queue into batches
+                batches = [queue[i:i + WARM_BATCH] for i in range(0, len(queue), WARM_BATCH)]
+                log.info("Processing %d items in %d batches (warm: %d workers/%ds timeout, "
+                         "FFprobe: %d workers)...",
+                         total_in_pass, len(batches), WARM_WORKERS, WARM_TIMEOUT, workers)
 
-                        if meta:
-                            update_media_item(db, mid, dict(meta))
-                            update_media_part(db, mid, dict(meta))
-                            create_media_streams(db, mid, dict(meta))
-                            analyzed += 1
-                            analyzed_mids.append(mid)
-                        elif retryable and pass_num < retries:
-                            retry_queue.append((mid, url))
-                        else:
-                            failed += 1
-                            # Store original DB URL for post-repair
-                            failed_items.append((mid, url_mapping.get(mid, url)))
+                for batch_idx, batch in enumerate(batches):
+                    # Phase 1: warm Zurg cache for this batch
+                    warm_ok = {}
+                    warm_fail = []
+                    with ThreadPoolExecutor(max_workers=WARM_WORKERS) as executor:
+                        futs = {
+                            executor.submit(_warm_cache, url, WARM_TIMEOUT): (mid, url)
+                            for mid, url in batch
+                        }
+                        for fut in as_completed(futs):
+                            mid, url = futs[fut]
+                            try:
+                                ok = fut.result()
+                            except Exception:
+                                ok = False
+                            if ok:
+                                warm_ok[mid] = url
+                            else:
+                                warm_fail.append((mid, url))
 
-                        done = analyzed + failed + len(retry_queue)
-                        if done % 10 == 0:
-                            db.commit()
-                        if done % 100 == 0:
-                            elapsed = time.time() - t0
-                            rate = (analyzed + failed) / elapsed if elapsed > 0 else 0
-                            remaining = total_items - analyzed - failed
-                            eta_m = int(remaining / rate / 60) if rate > 0 else 0
-                            log.info("FFprobe: %d/%d (%.1f/s, %d ok, %d failed, %d queued, ETA ~%dm)",
-                                     analyzed + failed, total_items, rate,
-                                     analyzed, failed, len(retry_queue), eta_m)
+                    # Phase 2: FFprobe warmed items (fast, ~0.5s each)
+                    if warm_fail:
+                        retry_queue.extend(warm_fail)
+
+                    if not warm_ok:
+                        if batch_idx % 5 == 0:
+                            log.info("Batch %d/%d: all %d warm-ups failed, queued for retry",
+                                     batch_idx + 1, len(batches), len(batch))
+                        continue
+
+                    # Ensure DB connection is still alive after warm-up delay
+                    db.ensure_connected()
+
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        futures = {
+                            executor.submit(run_ffprobe, url, ffprobe_path, timeout, 0, None): (mid, url)
+                            for mid, url in warm_ok.items()
+                        }
+                        for future in as_completed(futures):
+                            mid, url = futures[future]
+                            try:
+                                meta, retryable = future.result()
+                            except Exception as e:
+                                log.warning("FFprobe exception for media_item_id %d: %s", mid, e)
+                                meta, retryable = None, True
+
+                            if meta:
+                                update_media_item(db, mid, dict(meta))
+                                update_media_part(db, mid, dict(meta))
+                                create_media_streams(db, mid, dict(meta))
+                                analyzed += 1
+                                analyzed_mids.append(mid)
+                            elif retryable and pass_num < retries:
+                                retry_queue.append((mid, url))
+                            else:
+                                failed += 1
+                                failed_items.append((mid, url_mapping.get(mid, url)))
+
+                    db.commit()
+
+                    # Progress logging per batch
+                    processed = analyzed + failed
+                    elapsed = time.time() - t0
+                    rate = processed / elapsed if elapsed > 0 else 0
+                    remaining = total_items - processed
+                    eta_m = int(remaining / rate / 60) if rate > 0 else 0
+                    if (batch_idx + 1) % 5 == 0 or batch_idx == 0:
+                        log.info("Batch %d/%d: %d/%d done (%.1f/s, %d ok, %d failed, "
+                                 "%d queued, ETA ~%dm)",
+                                 batch_idx + 1, len(batches), processed, total_items,
+                                 rate, analyzed, failed, len(retry_queue), eta_m)
 
                 db.commit()
                 queue = retry_queue
+
+            # Items still in queue after all passes are unreachable — count as failed
+            if queue:
+                log.info("Marking %d items as failed after all retry passes (warm-up failures)",
+                         len(queue))
+                for mid, url in queue:
+                    failed += 1
+                    failed_items.append((mid, url_mapping.get(mid, url)))
 
             elapsed = time.time() - t0
             log.info("FFprobe done: %d analyzed, %d failed (%.1fs, %d passes)",
@@ -431,7 +498,7 @@ def cmd_update(args):
                         futs = {
                             executor.submit(
                                 run_ffprobe, retry_mapping[mid],
-                                ffprobe_path, timeout, 0, rl
+                                ffprobe_path, timeout, 0, None
                             ): mid
                             for mid in retry_mapping
                         }

@@ -19,10 +19,18 @@ class PlexDB:
         if self.is_pg:
             try:
                 import psycopg2
+                import psycopg2.extensions
             except ImportError:
                 sys.exit("psycopg2 is required for PostgreSQL mode: pip install psycopg2-binary")
             schema = pg_config.pop("schema", "plex")
             self._schema = f"{schema}." if schema else ""
+            self._pg_config = dict(pg_config)
+            self._pg_schema = schema
+            # Enable TCP keepalive to prevent idle connection drops
+            pg_config.setdefault("keepalives", 1)
+            pg_config.setdefault("keepalives_idle", 30)
+            pg_config.setdefault("keepalives_interval", 10)
+            pg_config.setdefault("keepalives_count", 5)
             self.conn = psycopg2.connect(**pg_config)
             self.conn.autocommit = False
             cur = self.conn.cursor()
@@ -31,6 +39,33 @@ class PlexDB:
         else:
             self.conn = sqlite3.connect(db_path)
             self.conn.row_factory = sqlite3.Row
+
+    def ensure_connected(self):
+        """Test the PG connection and reconnect if it was dropped."""
+        if not self.is_pg:
+            return
+        try:
+            cur = self.conn.cursor()
+            cur.execute("SELECT 1")
+            cur.close()
+        except Exception:
+            log.warning("PostgreSQL connection lost, reconnecting...")
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            import psycopg2
+            cfg = dict(self._pg_config)
+            cfg.setdefault("keepalives", 1)
+            cfg.setdefault("keepalives_idle", 30)
+            cfg.setdefault("keepalives_interval", 10)
+            cfg.setdefault("keepalives_count", 5)
+            self.conn = psycopg2.connect(**cfg)
+            self.conn.autocommit = False
+            cur = self.conn.cursor()
+            cur.execute(f"SET search_path TO {self._pg_schema}, public")
+            cur.close()
+            log.info("PostgreSQL reconnected")
 
     def close(self):
         self.conn.close()
