@@ -275,11 +275,12 @@ def cmd_update(args):
                                      len(repaired), len(hashes_to_repair), wait)
                             time.sleep(wait)
 
-            # Adaptive rate limiter: measures actual throughput and throttles to match.
-            # Starts with burst=workers (no throttling), adapts after first completions.
+            # Adaptive rate limiter: starts slow (2 concurrent), ramps up
+            # based on success ratio, backs off on failures.
             rl = AdaptiveRateLimiter(workers=workers)
+            total_items = len(url_mapping)
             log.info("Running FFprobe analysis on %d URLs (%d workers, %d retries)...",
-                     len(url_mapping), workers, retries)
+                     total_items, workers, retries)
 
             analyzed = 0
             failed = 0
@@ -287,43 +288,63 @@ def cmd_update(args):
             analyzed_mids = []
             t0 = time.time()
 
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {
-                    executor.submit(run_ffprobe, url, ffprobe_path, timeout, retries, rl): mid
-                    for mid, url in url_mapping.items()
-                }
-                for future in as_completed(futures):
-                    mid = futures[future]
-                    try:
-                        meta = future.result()
-                    except Exception as e:
-                        log.warning("FFprobe exception for media_item_id %d: %s", mid, e)
-                        meta = None
+            # Process in passes: failures go back in queue for next pass
+            queue = list(url_mapping.items())  # [(mid, url), ...]
 
-                    if meta:
-                        update_media_item(db, mid, dict(meta))
-                        update_media_part(db, mid, dict(meta), url_mapping.get(mid))
-                        create_media_streams(db, mid, dict(meta))
-                        analyzed += 1
-                        analyzed_mids.append(mid)
-                    else:
-                        failed += 1
-                        failed_items.append((mid, url_mapping[mid]))
+            for pass_num in range(1 + retries):
+                if not queue:
+                    break
+                if pass_num > 0:
+                    wait = min(30, 5 * pass_num)
+                    log.info("Retry pass %d: %d items after %ds cooldown...",
+                             pass_num, len(queue), wait)
+                    time.sleep(wait)
 
-                    total = analyzed + failed
-                    if total % 10 == 0:
-                        db.commit()
-                    if total % 100 == 0:
-                        elapsed = time.time() - t0
-                        rate = total / elapsed if elapsed > 0 else 0
-                        eta_s = (len(url_mapping) - total) / rate if rate > 0 else 0
-                        eta_m = int(eta_s / 60)
-                        log.info("FFprobe: %d/%d (%.1f/s, %d ok, %d failed, ETA ~%dm)",
-                                 total, len(url_mapping), rate, analyzed, failed, eta_m)
+                retry_queue = []
 
-            db.commit()
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = {
+                        executor.submit(run_ffprobe, url, ffprobe_path, timeout, 0, rl): (mid, url)
+                        for mid, url in queue
+                    }
+                    for future in as_completed(futures):
+                        mid, url = futures[future]
+                        try:
+                            meta, retryable = future.result()
+                        except Exception as e:
+                            log.warning("FFprobe exception for media_item_id %d: %s", mid, e)
+                            meta, retryable = None, True
+
+                        if meta:
+                            update_media_item(db, mid, dict(meta))
+                            update_media_part(db, mid, dict(meta), url)
+                            create_media_streams(db, mid, dict(meta))
+                            analyzed += 1
+                            analyzed_mids.append(mid)
+                        elif retryable and pass_num < retries:
+                            retry_queue.append((mid, url))
+                        else:
+                            failed += 1
+                            failed_items.append((mid, url))
+
+                        done = analyzed + failed + len(retry_queue)
+                        if done % 10 == 0:
+                            db.commit()
+                        if done % 100 == 0:
+                            elapsed = time.time() - t0
+                            rate = (analyzed + failed) / elapsed if elapsed > 0 else 0
+                            remaining = total_items - analyzed - failed
+                            eta_m = int(remaining / rate / 60) if rate > 0 else 0
+                            log.info("FFprobe: %d/%d (%.1f/s, %d ok, %d failed, %d queued, ETA ~%dm)",
+                                     analyzed + failed, total_items, rate,
+                                     analyzed, failed, len(retry_queue), eta_m)
+
+                db.commit()
+                queue = retry_queue
+
             elapsed = time.time() - t0
-            log.info("FFprobe done: %d analyzed, %d failed (%.1fs)", analyzed, failed, elapsed)
+            log.info("FFprobe done: %d analyzed, %d failed (%.1fs, %d passes)",
+                     analyzed, failed, elapsed, min(1 + retries, 1 + retries))
 
             # Zurg repair + retry (post-FFprobe, for items that still failed)
             if not zurg_url:
@@ -391,14 +412,14 @@ def cmd_update(args):
                         futs = {
                             executor.submit(
                                 run_ffprobe, retry_mapping[mid],
-                                ffprobe_path, timeout, 1, rl
+                                ffprobe_path, timeout, 0, rl
                             ): mid
                             for mid in retry_mapping
                         }
                         for fut in as_completed(futs):
                             mid = futs[fut]
                             try:
-                                meta = fut.result()
+                                meta, _retryable = fut.result()
                             except Exception:
                                 meta = None
                             if meta:

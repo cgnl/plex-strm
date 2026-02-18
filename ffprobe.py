@@ -147,74 +147,56 @@ def _normalize_audio_profile(profile_str):
     return None
 
 
-def run_ffprobe(url, ffprobe_path="ffprobe", timeout=30, retries=2, rate_limiter=None):
+def run_ffprobe(url, ffprobe_path="ffprobe", timeout=30, retries=0, rate_limiter=None):
     """Run ffprobe on a URL and return parsed metadata dict, or None on failure.
 
-    Retries up to `retries` times on timeout or transient errors.
-    If rate_limiter (AdaptiveRateLimiter) is provided, acquires a token before each
-    attempt and signals completion after.
+    Returns (meta_dict, is_retryable) tuple:
+      - (meta, False) on success
+      - (None, True)  on transient failure (5XX, timeout) — caller should retry later
+      - (None, False) on permanent failure (404, etc.) — don't retry
+
+    If rate_limiter (AdaptiveRateLimiter) is provided, acquires a token before
+    the request and signals completion after.
     """
     cmd = [ffprobe_path, "-v", "error",
            "-probesize", "128000", "-analyzeduration", "500000",
            "-print_format", "json",
            "-show_format", "-show_streams", "-show_chapters", url]
     url_id = url.rsplit("/", 1)[-1] if "/" in url else url[-30:]
-    last_error = None
 
     # Errors that mean the link is permanently dead — no point retrying
     _permanent_errors = ("403", "404", "410", "forbidden", "not found", "gone")
 
     _complete = rate_limiter.complete if rate_limiter else lambda success=True: None
 
-    for attempt in range(1 + retries):
-        if rate_limiter:
-            rate_limiter.acquire()
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True,
-                                     encoding="utf-8", errors="ignore", timeout=timeout)
-            if result.returncode != 0:
-                stderr_snip = (result.stderr or "")[:300].strip()
-                last_error = f"exit code {result.returncode}: {stderr_snip}"
-                stderr_low = stderr_snip.lower()
-
-                # Permanent errors: don't retry
-                if any(x in stderr_low for x in _permanent_errors):
-                    _complete(success=False)
-                    log.warning("FFprobe FAILED [%s]: %s", url_id, last_error)
-                    return None
-
-                _complete(success=False)
-                # 5XX / transient: retry with exponential backoff
-                if attempt < retries:
-                    backoff = 2 ** attempt  # 1s, 2s, 4s
-                    log.debug("FFprobe retry %d/%d [%s] in %ds: %s",
-                              attempt + 1, retries, url_id, backoff, last_error)
-                    time.sleep(backoff)
-                    continue
-                log.warning("FFprobe FAILED after %d attempts [%s]: %s", attempt + 1, url_id, last_error)
-                return None
-            _complete(success=True)
-            data = json.loads(result.stdout)
-            if attempt > 0:
-                log.info("FFprobe succeeded on retry %d [%s]", attempt, url_id)
-            return _parse_ffprobe(data)
-        except subprocess.TimeoutExpired:
+    if rate_limiter:
+        rate_limiter.acquire()
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                 encoding="utf-8", errors="ignore", timeout=timeout)
+        if result.returncode != 0:
+            stderr_snip = (result.stderr or "")[:300].strip()
+            stderr_low = stderr_snip.lower()
+            is_permanent = any(x in stderr_low for x in _permanent_errors)
             _complete(success=False)
-            last_error = f"timeout ({timeout}s)"
-            if attempt < retries:
-                time.sleep(2 ** attempt)
-                continue
-            log.warning("FFprobe FAILED after %d attempts [%s]: %s", attempt + 1, url_id, last_error)
-            return None
-        except json.JSONDecodeError as e:
-            last_error = f"JSON parse error: {e}"
-            log.warning("FFprobe FAILED [%s]: %s", url_id, last_error)
-            return None
-        except FileNotFoundError:
-            log.error("FFprobe binary not found: %s", ffprobe_path)
-            return None
-
-    return None
+            if is_permanent:
+                log.warning("FFprobe FAILED [%s]: %s", url_id, stderr_snip)
+            else:
+                log.debug("FFprobe transient failure [%s]: %s", url_id, stderr_snip)
+            return None, not is_permanent
+        _complete(success=True)
+        data = json.loads(result.stdout)
+        return _parse_ffprobe(data), False
+    except subprocess.TimeoutExpired:
+        _complete(success=False)
+        log.debug("FFprobe timeout [%s] (%ds)", url_id, timeout)
+        return None, True
+    except json.JSONDecodeError as e:
+        log.warning("FFprobe JSON error [%s]: %s", url_id, e)
+        return None, False
+    except FileNotFoundError:
+        log.error("FFprobe binary not found: %s", ffprobe_path)
+        return None, False
 
 
 def _parse_ffprobe(data):
