@@ -89,7 +89,9 @@ def run_ffprobe(url, ffprobe_path="ffprobe", timeout=30, retries=2):
     Retries up to `retries` times on timeout or transient errors.
     Does NOT retry on server errors (5XX, 4XX) — those are dead links.
     """
-    cmd = [ffprobe_path, "-v", "error", "-print_format", "json",
+    cmd = [ffprobe_path, "-v", "error",
+           "-probesize", "128000", "-analyzeduration", "500000",
+           "-print_format", "json",
            "-show_format", "-show_streams", "-show_chapters", url]
     url_id = url.rsplit("/", 1)[-1] if "/" in url else url[-30:]
     last_error = None
