@@ -8,8 +8,10 @@ Supports both SQLite and PostgreSQL (via plex-postgresql) backends.
 """
 
 import argparse
+import fcntl
 import logging
 import os
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -82,8 +84,23 @@ def _trigger_plex_analyze(db, media_item_ids, plex_url=None, plex_token=None):
     return triggered
 
 
+LOCKFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".plex_strm.lock")
+
+
 def cmd_update(args):
     """Read .strm files, inject URLs, run FFprobe, optionally download subtitles."""
+
+    # Acquire exclusive lock — prevents concurrent runs
+    lock_fp = open(LOCKFILE, "w")
+    try:
+        fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log.error("Another plex-strm update is already running (lock: %s). Exiting.", LOCKFILE)
+        lock_fp.close()
+        sys.exit(1)
+    lock_fp.write(str(os.getpid()))
+    lock_fp.flush()
+
     db = connect_from_args(args)
 
     try:
@@ -223,6 +240,41 @@ def cmd_update(args):
             timeout = args.timeout or int(os.environ.get("FFPROBE_TIMEOUT", "30"))
             retries = args.retries if hasattr(args, 'retries') and args.retries is not None else 2
 
+            # ── Pre-repair: proactively repair all torrents before FFprobe ──
+            zurg_url = getattr(args, 'zurg_url', None)
+            zurg_data_dir = getattr(args, 'zurg_data_dir', None)
+            skip_pre_repair = getattr(args, 'skip_pre_repair', False)
+            force_pre_repair = getattr(args, 'no_skip_pre_repair', False)
+            PRE_REPAIR_AUTO_SKIP_THRESHOLD = 200
+            if not skip_pre_repair and not force_pre_repair and len(url_mapping) > PRE_REPAIR_AUTO_SKIP_THRESHOLD:
+                log.info("Pre-repair: auto-skipping — %d items exceeds threshold (%d). "
+                         "Use post-repair for failures instead. "
+                         "Force with --no-skip-pre-repair.",
+                         len(url_mapping), PRE_REPAIR_AUTO_SKIP_THRESHOLD)
+                skip_pre_repair = True
+            rd_index, hash_states = {}, {}
+            if zurg_url and zurg_data_dir and not skip_pre_repair:
+                rd_index, hash_states = build_zurgtorrent_index(zurg_data_dir)
+                if rd_index:
+                    # Map all URLs to torrent hashes
+                    hashes_to_repair = set()
+                    for mid, url in url_mapping.items():
+                        rd_id = extract_rd_id_from_url(url)
+                        if rd_id and rd_id in rd_index:
+                            hashes_to_repair.add(rd_index[rd_id])
+
+                    if hashes_to_repair:
+                        log.info("Pre-repair: triggering Zurg repair for %d unique torrents "
+                                 "(%d URLs) before FFprobe...",
+                                 len(hashes_to_repair), len(url_mapping))
+                        repaired = trigger_repair_torrents(zurg_url, hashes_to_repair)
+                        if repaired:
+                            wait = min(30, max(5, len(repaired)))
+                            log.info("Pre-repair: %d/%d torrents submitted, "
+                                     "waiting %ds for RealDebrid...",
+                                     len(repaired), len(hashes_to_repair), wait)
+                            time.sleep(wait)
+
             log.info("Running FFprobe analysis on %d URLs (%d workers, %d retries)...",
                      len(url_mapping), workers, retries)
 
@@ -270,17 +322,19 @@ def cmd_update(args):
             elapsed = time.time() - t0
             log.info("FFprobe done: %d analyzed, %d failed (%.1fs)", analyzed, failed, elapsed)
 
-            # Zurg repair + retry
-            zurg_url = getattr(args, 'zurg_url', None)
-            zurg_data_dir = getattr(args, 'zurg_data_dir', None)
+            # Zurg repair + retry (post-FFprobe, for items that still failed)
+            if not zurg_url:
+                zurg_url = getattr(args, 'zurg_url', None)
+            if not zurg_data_dir:
+                zurg_data_dir = getattr(args, 'zurg_data_dir', None)
             server_error_items = [(mid, url) for mid, url in failed_items
                                   if is_server_error_url(mid, url)]
             if zurg_url and server_error_items:
-                log.info("Triggering Zurg repair for %d failed items...",
+                log.info("Post-repair: triggering Zurg repair for %d remaining failed items...",
                          len(server_error_items))
 
-                rd_index, hash_states = {}, {}
-                if zurg_data_dir:
+                # Reuse index from pre-repair if available
+                if not rd_index and zurg_data_dir:
                     rd_index, hash_states = build_zurgtorrent_index(zurg_data_dir)
 
                 repair_ok = False
@@ -427,6 +481,13 @@ def cmd_update(args):
             db.close()
         except Exception:
             pass
+        # Release lock
+        try:
+            fcntl.flock(lock_fp, fcntl.LOCK_UN)
+            lock_fp.close()
+            os.unlink(LOCKFILE)
+        except Exception:
+            pass
 
 
 def main():
@@ -483,6 +544,14 @@ def main():
     p_update.add_argument("--plex-token", metavar="TOKEN",
                           help="Plex auth token for analyze trigger "
                                "(default: PLEX_TOKEN env var)")
+    p_update.add_argument("--skip-pre-repair", action="store_true",
+                           help="Skip the pre-FFprobe Zurg repair pass. Useful for pipeline runs "
+                                "where torrents have already been repaired, to avoid spending all "
+                                "time on repair instead of FFprobe analysis. "
+                                "Auto-enabled when FFprobe queue > 200 items.")
+    p_update.add_argument("--no-skip-pre-repair", action="store_true",
+                           help="Force pre-repair even when FFprobe queue > 200 items "
+                                "(overrides auto-skip).")
     p_update.add_argument("--cleanup-broken", action="store_true",
                            help="Delete fully broken+unfixable torrents from RealDebrid. "
                                 "Only removes torrents where Zurg confirmed repair is impossible "

@@ -72,25 +72,45 @@ def trigger_repair_all(zurg_url):
     return False
 
 
-def trigger_repair_torrents(zurg_url, torrent_hashes):
+def _repair_one(base, h):
+    """Repair a single torrent. Returns hash on success, None on failure."""
+    import requests as _req
+    try:
+        resp = _req.post(f"{base}/manage/{h}/repair",
+                         timeout=15, allow_redirects=False)
+        if resp.status_code in (200, 303):
+            return h
+        log.debug("Repair %s returned status %d", h[:12], resp.status_code)
+    except Exception as e:
+        log.debug("Repair %s failed: %s", h[:12], e)
+    return None
+
+
+def trigger_repair_torrents(zurg_url, torrent_hashes, workers=8):
     """Trigger per-torrent repair via POST /manage/{hash}/repair.
 
     Returns set of hashes that were successfully submitted for repair.
     Zurg returns 303 See Other on success (redirect to manage page).
+    Uses parallel workers (default 8) for speed.
     """
-    import requests
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     base = zurg_url.rstrip('/')
+    hashes = list(torrent_hashes)
     repaired = set()
-    for h in torrent_hashes:
-        try:
-            resp = requests.post(f"{base}/manage/{h}/repair",
-                                 timeout=15, allow_redirects=False)
-            if resp.status_code in (200, 303):
-                repaired.add(h)
-            else:
-                log.debug("Repair %s returned status %d", h[:12], resp.status_code)
-        except Exception as e:
-            log.debug("Repair %s failed: %s", h[:12], e)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_repair_one, base, h): h for h in hashes}
+        done = 0
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result:
+                repaired.add(result)
+            done += 1
+            if done % 500 == 0:
+                log.info("Per-torrent repair: %d/%d submitted (%d ok)...",
+                         done, len(hashes), len(repaired))
+
     log.info("Per-torrent repair: submitted %d/%d torrents",
              len(repaired), len(torrent_hashes))
     return repaired
