@@ -4,6 +4,8 @@ Inject streaming URLs into the Plex database for Direct Play. Reads `.strm` file
 
 Supports both **SQLite** and **PostgreSQL** ([plex-postgresql](https://github.com/cgnl/plex-postgresql)) backends.
 
+> **Note:** Currently only tested with PostgreSQL. SQLite support is implemented but untested — use at your own risk.
+
 ## How it works
 
 1. Finds all `.strm` file references in `media_parts`
