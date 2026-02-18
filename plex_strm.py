@@ -275,9 +275,9 @@ def cmd_update(args):
                                      len(repaired), len(hashes_to_repair), wait)
                             time.sleep(wait)
 
-            # Adaptive rate limiter: starts slow (2 concurrent), ramps up
-            # based on success ratio, backs off on failures.
-            rl = AdaptiveRateLimiter(workers=workers)
+            # Rate limiter disabled — workers are the concurrency limit,
+            # queue-based retries handle transient failures.
+            rl = None
             total_items = len(url_mapping)
 
             # Rewrite URLs to hit Zurg directly (skip Caddy/proxy chain)

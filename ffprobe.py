@@ -130,30 +130,58 @@ def _normalize_audio_profile(profile_str):
     return None
 
 
+def _warm_cache(url, timeout=12):
+    """Pre-warm Zurg's RD redirect cache with a tiny range request.
+
+    Returns True if the URL is reachable (2XX), False otherwise.
+    This triggers Zurg's RD API call so subsequent FFprobe requests
+    hit the cached redirect and complete in <1s instead of ~10s.
+    """
+    import urllib.request
+    url_id = url.rsplit("/", 1)[-1] if "/" in url else url[-30:]
+    try:
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Range", "bytes=0-0")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read(1)
+            return True
+    except urllib.error.HTTPError as e:
+        if e.code == 206:
+            return True
+        log.debug("Warm-cache %s: HTTP %d", url_id, e.code)
+        return False
+    except Exception:
+        return False
+
+
 def run_ffprobe(url, ffprobe_path="ffprobe", timeout=30, retries=0, rate_limiter=None):
     """Run ffprobe on a URL and return parsed metadata dict, or None on failure.
+
+    First warms Zurg's RD redirect cache with a tiny range request.
+    If warm-up fails (5XX), returns immediately as retryable without
+    wasting time on a full FFprobe call.
 
     Returns (meta_dict, is_retryable) tuple:
       - (meta, False) on success
       - (None, True)  on transient failure (5XX, timeout) — caller should retry later
       - (None, False) on permanent failure (404, etc.) — don't retry
-
-    If rate_limiter (AdaptiveRateLimiter) is provided, acquires a token before
-    the request and signals completion after.
     """
+    url_id = url.rsplit("/", 1)[-1] if "/" in url else url[-30:]
+
+    # Step 1: warm Zurg cache — if this fails, skip FFprobe entirely
+    if not _warm_cache(url, timeout=min(12, timeout)):
+        log.debug("Warm-cache failed [%s], queuing for retry", url_id)
+        return None, True
+
+    # Step 2: FFprobe with warm cache — should complete in <1s
     cmd = [ffprobe_path, "-v", "error",
            "-probesize", "128000", "-analyzeduration", "500000",
            "-print_format", "json",
            "-show_format", "-show_streams", "-show_chapters", url]
-    url_id = url.rsplit("/", 1)[-1] if "/" in url else url[-30:]
 
     # Errors that mean the link is permanently dead — no point retrying
     _permanent_errors = ("403", "404", "410", "forbidden", "not found", "gone")
 
-    _complete = rate_limiter.complete if rate_limiter else lambda success=True: None
-
-    if rate_limiter:
-        rate_limiter.acquire()
     try:
         result = subprocess.run(cmd, capture_output=True, text=True,
                                  encoding="utf-8", errors="ignore", timeout=timeout)
@@ -161,17 +189,14 @@ def run_ffprobe(url, ffprobe_path="ffprobe", timeout=30, retries=0, rate_limiter
             stderr_snip = (result.stderr or "")[:300].strip()
             stderr_low = stderr_snip.lower()
             is_permanent = any(x in stderr_low for x in _permanent_errors)
-            _complete(success=False)
             if is_permanent:
                 log.warning("FFprobe FAILED [%s]: %s", url_id, stderr_snip)
             else:
                 log.debug("FFprobe transient failure [%s]: %s", url_id, stderr_snip)
             return None, not is_permanent
-        _complete(success=True)
         data = json.loads(result.stdout)
         return _parse_ffprobe(data), False
     except subprocess.TimeoutExpired:
-        _complete(success=False)
         log.debug("FFprobe timeout [%s] (%ds)", url_id, timeout)
         return None, True
     except json.JSONDecodeError as e:
