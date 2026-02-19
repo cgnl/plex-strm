@@ -1,0 +1,66 @@
+# Zurg config optimized for plex-strm STRM streaming setup.
+#
+# Key design decisions:
+#   - serve_from_rd: true  -> Zurg returns 307 redirects to RD CDN (no proxying)
+#   - save_strm_files: true -> Zurg generates .strm files for Plex
+#   - on_library_update triggers the pipeline on every torrent change
+#   - restrict_repair_to_cached avoids wasting credits on uncached repairs
+#   - Small network_buffer_size since Zurg only sends redirects, not data
+
+zurg: v1
+token: YOUR_REALDEBRID_TOKEN
+port: 9091
+base_url: https://user:password@your-domain.com
+
+# Event-driven pipeline: runs on every library change
+on_library_update: /path/to/strm_pipeline.sh
+
+# Poll RD for changes (backup for on_library_update)
+check_for_changes_every_secs: 60
+
+# Repair
+enable_repair: true
+repair_every_mins: 120
+restrict_repair_to_cached: true
+
+auto_delete_rar_torrents: true
+
+# Rate limits (RD enforces ~120 API calls/min)
+api_rate_limit_per_minute: 120
+torrents_rate_limit_per_minute: 60
+
+cache_network_test_results: true
+retries_until_failed: 5
+retry_503_errors: true
+delete_error_torrents: false
+
+# 16 workers is safe for RD rate limits
+concurrent_workers: 16
+
+# 120s is plenty for unrestrict + 307 redirect
+download_timeout_secs: 120
+
+# 4MB buffer (Zurg sends redirects, not data)
+network_buffer_size: 4194304
+
+# Prefetch disabled: links are unrestricted on demand via STRM
+prefetch: false
+
+serve_from_rd: true
+save_strm_files: true
+
+directories:
+  shows:
+    group: media
+    group_order: 10
+    only_show_files_with_size_gte: 157286400
+    filters:
+      - has_episodes: true
+
+  movies:
+    group: media
+    group_order: 20
+    only_show_the_biggest_file: true
+    only_show_files_with_size_gte: 157286400
+    filters:
+      - regex: /.*/
