@@ -4,7 +4,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY plex_strm.py requirements.txt /app/
+COPY *.py requirements.txt /app/
 WORKDIR /app
 
 RUN pip install --no-cache-dir -r requirements.txt

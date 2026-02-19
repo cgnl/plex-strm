@@ -1,0 +1,47 @@
+services:
+  # STRM fallback proxy (tries alternative STRM IDs on Zurg 5XX)
+  strm-proxy:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ["python", "strm_proxy.py"]
+    environment:
+      ZURG_URL: http://host.docker.internal:9091
+      ZURG_USER: ${ZURG_USER}
+      ZURG_PASS: ${ZURG_PASS}
+      PROXY_PORT: "8765"
+      PLEX_PG_HOST: ${PLEX_PG_HOST:-host.docker.internal}
+      PLEX_PG_PORT: ${PLEX_PG_PORT:-5432}
+      PLEX_PG_DATABASE: ${PLEX_PG_DATABASE:-plex}
+      PLEX_PG_USER: ${PLEX_PG_USER:-plex}
+      PLEX_PG_PASSWORD: ${PLEX_PG_PASSWORD:-plex}
+      PLEX_PG_SCHEMA: ${PLEX_PG_SCHEMA:-plex}
+    ports:
+      - "8765:8765"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  # Caddy front door:
+  #   /strm/* -> strm-proxy
+  #   everything else -> Plex on host
+  caddy:
+    image: caddy-dns/cloudflare:2.8.4
+    depends_on:
+      - strm-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

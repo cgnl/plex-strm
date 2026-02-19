@@ -55,6 +55,12 @@ plex.example.com {
 }
 ```
 
+For a production-style setup with STRM fallback, use the bundled examples:
+
+- `examples/Caddyfile` — Plex + `/strm/*` split routing
+- `examples/docker-compose.strm-stack.yml` — runs `strm_proxy` + Caddy
+- `strm_proxy.py` — tries alternative STRM IDs on Zurg 5XX and triggers repair
+
 This way both Plex and Zurg share the same domain. Clients requesting `/strm/*` hit Zurg directly, everything else goes to Plex.
 
 ### Basic authentication
