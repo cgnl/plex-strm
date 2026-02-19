@@ -101,6 +101,7 @@ This rewrites all STRM URLs to `https://myuser:mypassword@plex.example.com/strm/
 | `plex_strm.py` | Entry point — CLI parsing, `update` command orchestration |
 | `db.py` | Database abstraction (SQLite + PostgreSQL), library helpers, backup |
 | `ffprobe.py` | FFprobe runner, stream parser, `media_items`/`media_streams` updates |
+| `rd_client.py` | Real-Debrid REST client (rate limiting, backoff, retries, metrics) |
 | `zurg.py` | Zurgtorrent index, per-torrent repair, broken torrent cleanup |
 | `subtitles.py` | OpenSubtitles search/download/login, Plex DB registration |
 | `protect.py` | 4-layer trigger protection — install, drop, status, revert |

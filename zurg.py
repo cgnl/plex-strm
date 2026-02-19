@@ -4,7 +4,8 @@ import json
 import logging
 import os
 import re
-import time
+
+from rd_client import RDClient
 
 log = logging.getLogger("plex-strm")
 
@@ -133,8 +134,6 @@ def cleanup_broken_torrents(data_dir, rd_api_token, dry_run=False):
 
     Returns (deleted_count, skipped_count, error_count).
     """
-    import requests as _req
-
     if not data_dir or not os.path.isdir(data_dir):
         log.warning("cleanup-broken: data dir %s not found", data_dir)
         return 0, 0, 0
@@ -186,30 +185,22 @@ def cleanup_broken_torrents(data_dir, rd_api_token, dry_run=False):
         return 0, len(candidates), 0
 
     # Need to map zurgtorrent hashes to RD torrent IDs via the RD API
-    headers = {"Authorization": f"Bearer {rd_api_token}"}
+    # Keep this separate from Zurg itself; this only affects cleanup workflow.
+    rd = RDClient(
+        rd_api_token,
+        rate_limit_per_minute=200,  # stay below RD hard cap (250/min)
+        timeout=30,
+        max_retries=6,
+    )
+
     hash_to_rd_id = {}
-    page = 1
-    while True:
-        try:
-            resp = _req.get(
-                f"https://api.real-debrid.com/rest/1.0/torrents?limit=2500&page={page}",
-                headers=headers, timeout=30)
-            if resp.status_code == 429:
-                log.warning("cleanup-broken: RD rate limited, waiting 10s...")
-                time.sleep(10)
-                continue
-            resp.raise_for_status()
-            torrents = resp.json()
-            if not torrents:
-                break
-            for t in torrents:
-                h = t.get('hash', '').lower()
-                if h:
-                    hash_to_rd_id[h] = t['id']
-            page += 1
-        except Exception as e:
-            log.error("cleanup-broken: failed to fetch RD torrents page %d: %s", page, e)
-            break
+    try:
+        for t in rd.iter_torrents(page_size=2500):
+            h = t.get('hash', '').lower()
+            if h:
+                hash_to_rd_id[h] = t['id']
+    except Exception as e:
+        log.error("cleanup-broken: failed to fetch RD torrents: %s", e)
 
     log.info("cleanup-broken: fetched %d RD torrents for hash mapping", len(hash_to_rd_id))
 
@@ -226,26 +217,27 @@ def cleanup_broken_torrents(data_dir, rd_api_token, dry_run=False):
             continue
 
         try:
-            resp = _req.delete(
-                f"https://api.real-debrid.com/rest/1.0/torrents/delete/{rd_id}",
-                headers=headers, timeout=15)
-            if resp.status_code == 429:
-                log.warning("cleanup-broken: RD rate limited during delete, stopping")
-                skipped += len(candidates) - deleted - skipped - errors
-                break
-            if resp.status_code in (200, 204):
+            ok = rd.delete_torrent(rd_id)
+            if ok:
                 log.info("cleanup-broken: deleted %s (%s) [%s]",
                          c['name'][:50], c['reason'], rd_id)
                 deleted += 1
             else:
-                log.warning("cleanup-broken: delete %s returned %d", rd_id, resp.status_code)
                 errors += 1
         except Exception as e:
             log.error("cleanup-broken: delete %s failed: %s", rd_id, e)
             errors += 1
 
-        # Small delay to avoid rate limiting
-        time.sleep(0.3)
+    m = rd.metrics
+    rd.close()
+    log.info(
+        "cleanup-broken: RD metrics requests=%d retries=%d 429=%d 5xx=%d net_err=%d",
+        m.get("requests", 0),
+        m.get("retries", 0),
+        m.get("rate_limited_429", 0),
+        m.get("server_5xx", 0),
+        m.get("network_errors", 0),
+    )
 
     log.info("cleanup-broken: deleted %d, skipped %d, errors %d (of %d candidates)",
              deleted, skipped, errors, len(candidates))

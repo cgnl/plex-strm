@@ -161,10 +161,31 @@ def run_ffprobe(url, ffprobe_path="ffprobe", timeout=30, retries=0, rate_limiter
     """
     url_id = url.rsplit("/", 1)[-1] if "/" in url else url[-30:]
 
-    cmd = [ffprobe_path, "-v", "error",
-           "-probesize", "128000", "-analyzeduration", "500000",
-           "-print_format", "json",
-           "-show_format", "-show_streams", "-show_chapters", url]
+    # Keep ffprobe I/O minimal: compact JSON + only the fields we actually use.
+    # This reduces payload size and JSON parsing overhead while preserving all
+    # metadata needed for Plex DB writes.
+    show_entries = (
+        "format=duration,size,bit_rate,format_name:"
+        "stream=codec_type,codec_name,width,height,coded_width,coded_height,"
+        "bit_rate,disposition,profile,bits_per_raw_sample,r_frame_rate,level,"
+        "refs,pix_fmt,chroma_location,field_order,color_primaries,color_range,"
+        "color_space,color_transfer,channels,channel_layout,sample_rate:"
+        "stream_tags=language,title:"
+        "chapter=start_time,end_time:"
+        "chapter_tags=title"
+    )
+
+    cmd = [
+        ffprobe_path,
+        "-v", "error",
+        "-probesize", "128000",
+        "-analyzeduration", "500000",
+        "-rw_timeout", "15000000",
+        "-of", "json=compact=1",
+        "-show_entries", show_entries,
+        "-show_format", "-show_streams", "-show_chapters",
+        url,
+    ]
 
     # Errors that mean the link is permanently dead — no point retrying
     _permanent_errors = ("403", "404", "410", "forbidden", "not found", "gone")
