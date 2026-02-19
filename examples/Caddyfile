@@ -1,0 +1,108 @@
+# Example Caddy config for Plex + Zurg STRM + strm_proxy fallback.
+#
+# Flow:
+#   Client -> Caddy :443
+#      /strm/* -> strm_proxy :8765 -> Zurg :9091 -> RD CDN (307 redirect)
+#      all else -> Plex :32400
+#
+# Requirements:
+#   - CLOUDFLARE_API_TOKEN env var (for DNS challenge)
+#   - strm_proxy.py running on localhost:8765
+#   - Zurg running on localhost:9091
+#   - Plex running on localhost:32400
+
+your-plex-domain.example.com {
+    tls {
+        dns cloudflare {
+            api_token {env.CLOUDFLARE_API_TOKEN}
+        }
+        resolvers 1.1.1.1 8.8.8.8
+        propagation_timeout 5m
+        propagation_delay 30s
+    }
+
+    log {
+        output stdout
+        format console
+    }
+
+    # CORS for Plex web clients
+    header {
+        Access-Control-Allow-Origin "{header.Origin}"
+        Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS"
+        Access-Control-Allow-Headers "*"
+        Access-Control-Allow-Credentials "true"
+    }
+
+    @cors_preflight method OPTIONS
+    handle @cors_preflight {
+        header Access-Control-Max-Age "86400"
+        respond "" 204
+    }
+
+    # ------------------------------------------------------------
+    # STRM path routing
+    # ------------------------------------------------------------
+
+    # LAN clients: no auth required (helps clients that drop credentials
+    # on cross-host redirects, e.g. some Kodi/plex.direct paths).
+    @strm_lan {
+        path /strm/*
+        remote_ip 192.168.0.0/16 172.16.0.0/12 10.0.0.0/8 127.0.0.1
+    }
+    handle @strm_lan {
+        reverse_proxy 127.0.0.1:8765 {
+            header_up X-Real-IP {remote_host}
+            flush_interval -1
+            transport http {
+                read_timeout 6000s
+                write_timeout 6000s
+            }
+        }
+    }
+
+    # External clients: require basic auth for /strm/*
+    # Generate hash with: caddy hash-password --plaintext 'YOUR_PASSWORD'
+    handle /strm/* {
+        basic_auth {
+            zurg REPLACE_WITH_BCRYPT_HASH
+        }
+        reverse_proxy 127.0.0.1:8765 {
+            header_up X-Real-IP {remote_host}
+            flush_interval -1
+            transport http {
+                read_timeout 6000s
+                write_timeout 6000s
+            }
+        }
+    }
+
+    # Everything else goes to Plex
+    reverse_proxy 127.0.0.1:32400 {
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Plex-Client-IP {remote_host}
+        header_up Connection {header.Connection}
+        header_up Upgrade {header.Upgrade}
+        header_up Sec-WebSocket-Extensions {header.Sec-WebSocket-Extensions}
+        header_up Sec-WebSocket-Key {header.Sec-WebSocket-Key}
+        header_up Sec-WebSocket-Version {header.Sec-WebSocket-Version}
+
+        # Prevent duplicate CORS headers from upstream
+        header_down -Access-Control-Allow-Origin
+        header_down -Access-Control-Allow-Methods
+        header_down -Access-Control-Allow-Headers
+        header_down -Access-Control-Allow-Credentials
+
+        flush_interval -1
+        transport http {
+            versions 1.1
+            dial_timeout 30s
+            response_header_timeout 120s
+            read_timeout 6000s
+            write_timeout 6000s
+            keepalive 32s
+            keepalive_idle_conns 32
+        }
+    }
+}
