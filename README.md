@@ -105,6 +105,8 @@ This rewrites all STRM URLs to `https://myuser:mypassword@plex.example.com/strm/
 | `zurg.py` | Zurgtorrent index, per-torrent repair, broken torrent cleanup |
 | `subtitles.py` | OpenSubtitles search/download/login, Plex DB registration |
 | `protect.py` | 4-layer trigger protection — install, drop, status, revert |
+| `strm_proxy.py` | STRM fallback proxy: alternate STRM IDs, optional local-file fallback, repair trigger |
+| `repair_broken.py` | One-by-one Zurg repair helper for broken STRM IDs (uses tiny ranged GET validation) |
 
 ## Install
 
@@ -213,6 +215,22 @@ plex-strm update --pg --reanalyze 2 --workers 8
 | Variable | Description |
 |----------|-------------|
 | `RD_API_TOKEN` | RealDebrid API token (required for `--cleanup-broken`) |
+
+### STRM proxy / repair helper
+
+| Variable | Description |
+|----------|-------------|
+| `ZURG_URL` | Zurg base URL (default: `http://localhost:9091`) |
+| `ZURG_USER` | Zurg basic auth username (optional) |
+| `ZURG_PASS` | Zurg basic auth password (optional) |
+| `PROXY_PORT` | `strm_proxy.py` listen port (default: `8765`) |
+| `PLEX_DB_MODE` | DB mode for `strm_proxy.py` and `repair_broken.py`: `postgres` or `sqlite` (default: `postgres`) |
+| `PLEX_SQLITE_PATH` | Plex SQLite DB path when `PLEX_DB_MODE=sqlite` |
+| `ENABLE_LOCAL_FALLBACK` | Enable local file fallback in `strm_proxy.py` (`1`/`0`, default `1`) |
+| `LOCAL_FALLBACK_STRICT` | Enforce codec/container compatibility for local fallback (default `1`) |
+| `LOCAL_FALLBACK_MATCH_MODE` | Strictness mode: `all`, `av`, or `audio` (default `all`) |
+| `LOCAL_FALLBACK_RESOLUTION_PREFERENCE` | Fallback ranking: `1080p`, `balanced`, `4k` (default `1080p`) |
+| `PLEX_TOKEN` | Plex token used for local fallback `/library/parts/...` redirect |
 
 ### URL rewriting
 
