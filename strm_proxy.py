@@ -24,7 +24,7 @@ try:
 except Exception:  # pragma: no cover - optional for sqlite mode
     psycopg2 = None
 import requests
-from flask import Flask, request, Response
+from flask import Flask, request, Response, stream_with_context
 
 # ---------------------------------------------------------------------------
 # Config
@@ -68,6 +68,8 @@ LOCAL_FALLBACK_RESOLUTION_PREFERENCE = os.environ.get(
     "LOCAL_FALLBACK_RESOLUTION_PREFERENCE", "1080p"
 ).strip().lower()
 PLEX_FALLBACK_TOKEN = os.environ.get("PLEX_TOKEN", "")
+FOLLOW_RD_REDIRECTS = os.environ.get("FOLLOW_RD_REDIRECTS", "0").lower() in ("1", "true", "yes", "on")
+STREAM_CHUNK_SIZE = max(64 * 1024, int(os.environ.get("STREAM_CHUNK_SIZE", str(1024 * 1024))))
 
 # Cache broken STRM IDs (avoid repeated 500s to Zurg)
 BROKEN_CACHE_TTL = 300  # seconds
@@ -86,6 +88,12 @@ logging.basicConfig(
 log = logging.getLogger("strm-proxy")
 
 app = Flask(__name__)
+
+# Shared HTTP session for upstream calls.
+# Disable environment proxy auto-detection to avoid macOS CoreFoundation
+# proxy lookup (_scproxy) in forked worker processes.
+HTTP = requests.Session()
+HTTP.trust_env = False
 
 # ---------------------------------------------------------------------------
 # State
@@ -124,7 +132,7 @@ def trigger_repair():
         return
     last_repair_time = now
     try:
-        resp = requests.post(
+        resp = HTTP.post(
             f"{ZURG_URL}/torrents/repair",
             auth=zurg_auth(),
             timeout=10,
@@ -513,7 +521,7 @@ def try_zurg(strm_id: str):
         elif is_head_probe:
             headers["Range"] = "bytes=0-1"
 
-        resp = requests.get(
+        resp = HTTP.get(
             f"{ZURG_URL}/strm/{strm_id}",
             auth=zurg_auth(),
             allow_redirects=False,
@@ -528,6 +536,73 @@ def try_zurg(strm_id: str):
         return None
 
 
+def _proxy_rd_redirect(upstream_resp):
+    """Optionally follow RD CDN redirects and stream bytes via this proxy."""
+    location = upstream_resp.headers.get("Location", "")
+    if not FOLLOW_RD_REDIRECTS:
+        return None
+    if request.method != "GET":
+        return None
+    if upstream_resp.status_code not in (301, 302, 303, 307, 308):
+        return None
+    if "download.real-debrid.com" not in location:
+        return None
+
+    headers = {}
+    incoming_range = request.headers.get("Range")
+    if incoming_range:
+        headers["Range"] = incoming_range
+
+    try:
+        rd_resp = HTTP.get(
+            location,
+            headers=headers,
+            stream=True,
+            allow_redirects=False,
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        log.warning("Failed to follow RD redirect: %s", e)
+        return None
+
+    out_headers = {}
+    for h in (
+        "content-type",
+        "content-length",
+        "content-range",
+        "accept-ranges",
+        "etag",
+        "last-modified",
+        "cache-control",
+    ):
+        v = rd_resp.headers.get(h)
+        if v is not None:
+            out_headers[h] = v
+
+    def generate():
+        try:
+            for chunk in rd_resp.iter_content(chunk_size=STREAM_CHUNK_SIZE):
+                if chunk:
+                    yield chunk
+        finally:
+            rd_resp.close()
+
+    log.info("Following RD redirect via proxy for client stream")
+    return Response(stream_with_context(generate()), status=rd_resp.status_code, headers=out_headers)
+
+
+def _build_client_response(upstream_resp):
+    followed = _proxy_rd_redirect(upstream_resp)
+    if followed is not None:
+        return followed
+
+    headers = dict(upstream_resp.headers)
+    for h in ("transfer-encoding", "connection", "keep-alive"):
+        headers.pop(h, None)
+    body = b"" if request.method == "HEAD" else upstream_resp.content
+    return Response(body, status=upstream_resp.status_code, headers=headers)
+
+
 @app.route("/strm/<strm_id>", methods=["GET", "HEAD"])
 def proxy_strm(strm_id: str):
     # Fast path: try Zurg directly (unless cached as broken)
@@ -535,16 +610,7 @@ def proxy_strm(strm_id: str):
         resp = try_zurg(strm_id)
         if resp is not None:
             # Success — pass through Zurg's response (usually 307 redirect)
-            headers = dict(resp.headers)
-            # Remove hop-by-hop headers
-            for h in ("transfer-encoding", "connection", "keep-alive"):
-                headers.pop(h, None)
-            body = b"" if request.method == "HEAD" else resp.content
-            return Response(
-                body,
-                status=resp.status_code,
-                headers=headers,
-            )
+            return _build_client_response(resp)
         # Zurg returned 5XX
         mark_broken(strm_id)
 
@@ -570,15 +636,7 @@ def proxy_strm(strm_id: str):
         resp = try_zurg(alt_id)
         if resp is not None:
             log.info("Fallback success: %s -> %s (status %d)", strm_id, alt_id, resp.status_code)
-            headers = dict(resp.headers)
-            for h in ("transfer-encoding", "connection", "keep-alive"):
-                headers.pop(h, None)
-            body = b"" if request.method == "HEAD" else resp.content
-            return Response(
-                body,
-                status=resp.status_code,
-                headers=headers,
-            )
+            return _build_client_response(resp)
         mark_broken(alt_id)
 
     log.warning("All alternatives broken for %s", strm_id)
@@ -605,6 +663,8 @@ def status():
         "local_fallback_match_mode": LOCAL_FALLBACK_MATCH_MODE,
         "local_fallback_resolution_preference": LOCAL_FALLBACK_RESOLUTION_PREFERENCE,
         "has_plex_fallback_token": bool(PLEX_FALLBACK_TOKEN),
+        "follow_rd_redirects": FOLLOW_RD_REDIRECTS,
+        "stream_chunk_size": STREAM_CHUNK_SIZE,
         "plex_db_mode": PLEX_DB_MODE,
     }
 
@@ -613,7 +673,7 @@ def status():
 @app.route("/strm/<path:path>")
 def proxy_other(path):
     try:
-        resp = requests.get(
+        resp = HTTP.get(
             f"{ZURG_URL}/strm/{path}",
             auth=zurg_auth(),
             allow_redirects=False,
