@@ -184,13 +184,26 @@ def find_alternatives(strm_id: str):
 # Proxy logic
 # ---------------------------------------------------------------------------
 def try_zurg(strm_id: str):
-    """Send request to Zurg, return response or None on 5XX."""
+    """Send request to Zurg, return response or None on 5XX.
+
+    For incoming HEAD requests, probe upstream with a tiny ranged GET so
+    unrestrict failures are surfaced (HEAD alone can return false-positive 200).
+    """
     auth = (ZURG_USER, ZURG_PASS) if ZURG_USER else None
     try:
+        is_head_probe = request.method == "HEAD"
+        headers = {}
+        incoming_range = request.headers.get("Range")
+        if incoming_range:
+            headers["Range"] = incoming_range
+        elif is_head_probe:
+            headers["Range"] = "bytes=0-1"
+
         resp = requests.get(
             f"{ZURG_URL}/strm/{strm_id}",
             auth=auth,
             allow_redirects=False,
+            headers=headers,
             timeout=10,
         )
         if resp.status_code >= 500:
@@ -201,7 +214,7 @@ def try_zurg(strm_id: str):
         return None
 
 
-@app.route("/strm/<strm_id>")
+@app.route("/strm/<strm_id>", methods=["GET", "HEAD"])
 def proxy_strm(strm_id: str):
     # Fast path: try Zurg directly (unless cached as broken)
     if not is_broken(strm_id):
@@ -210,8 +223,9 @@ def proxy_strm(strm_id: str):
             headers = dict(resp.headers)
             for h in ("transfer-encoding", "connection", "keep-alive"):
                 headers.pop(h, None)
+            body = b"" if request.method == "HEAD" else resp.content
             return Response(
-                resp.content,
+                body,
                 status=resp.status_code,
                 headers=headers,
             )
@@ -238,8 +252,9 @@ def proxy_strm(strm_id: str):
             headers = dict(resp.headers)
             for h in ("transfer-encoding", "connection", "keep-alive"):
                 headers.pop(h, None)
+            body = b"" if request.method == "HEAD" else resp.content
             return Response(
-                resp.content,
+                body,
                 status=resp.status_code,
                 headers=headers,
             )
