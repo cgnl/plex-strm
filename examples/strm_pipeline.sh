@@ -7,7 +7,7 @@
 #   2. organize_strm.py: create/update symlinks
 #   3. Plex library scan on changed libraries
 #
-# Safety: lockfile prevents concurrent runs, timeout kills long-running ffprobe.
+# Safety: lockfile prevents concurrent runs.
 
 set -uo pipefail
 
@@ -18,7 +18,6 @@ LOCKFILE="/tmp/strm_pipeline.lock"
 # ── Configuration (set these for your environment) ────────────
 export PLEX_TOKEN="YOUR_PLEX_TOKEN"
 export PLEX_URL="http://localhost:32400"
-MAX_PLEX_STRM_TIME=270  # Max 4.5 minutes
 
 # PostgreSQL config
 export PLEX_PG_HOST=localhost
@@ -69,15 +68,41 @@ if ! curl -s -o /dev/null -w '' --max-time 5 "$ZURG_URL/dav/" 2>/dev/null; then
     exit 0
 fi
 
+# Skip while Plex is still scanning STRM libraries.
+SCAN_ACTIVE=$(python3 - <<'PY'
+import os, urllib.request, urllib.parse, xml.etree.ElementTree as ET
+url = os.environ.get("PLEX_URL", "http://localhost:32400")
+token = os.environ.get("PLEX_TOKEN", "")
+try:
+    q = urllib.parse.urlencode({"X-Plex-Token": token})
+    with urllib.request.urlopen(f"{url}/activities?{q}", timeout=10) as r:
+        root = ET.fromstring(r.read())
+    active = any(
+        a.attrib.get("type") == "library.update.section"
+        and "Scanning STRM" in (a.attrib.get("title") or "")
+        for a in root.findall('.//Activity')
+    )
+    print("1" if active else "0")
+except Exception:
+    print("0")
+PY
+)
+
+if [ "$SCAN_ACTIVE" = "1" ]; then
+    log "SKIP: STRM scan still active"
+    log "=== Pipeline done (skipped) ==="
+    exit 0
+fi
+
 # ── Step 1: plex_strm.py ──────────────────────────────────────
-log "Step 1: Running plex_strm.py (new items only, timeout ${MAX_PLEX_STRM_TIME}s)"
+log "Step 1: Running plex_strm.py (new items only)"
 
 LIB_ARGS=""
 for name in "${LIBRARY_NAMES[@]}"; do
     LIB_ARGS="$LIB_ARGS --library \"$name\""
 done
 
-PLEX_STRM_OUT=$(timeout "$MAX_PLEX_STRM_TIME" python3 "$PLEX_STRM_PY" --pg \
+PLEX_STRM_OUT=$(python3 "$PLEX_STRM_PY" --pg \
     $LIB_ARGS \
     update --protect --workers 4 --timeout 30 --retries 2 \
     --zurg-url "$ZURG_URL" \
@@ -85,11 +110,7 @@ PLEX_STRM_OUT=$(timeout "$MAX_PLEX_STRM_TIME" python3 "$PLEX_STRM_PY" --pg \
     --cleanup-broken \
     --base-url "$BASE_URL" 2>&1) || {
     EXIT_CODE=$?
-    if [ "$EXIT_CODE" -eq 124 ]; then
-        log "  plex_strm: timed out after ${MAX_PLEX_STRM_TIME}s (will continue next run)"
-    else
-        log "  plex_strm: exited with code $EXIT_CODE"
-    fi
+    log "  plex_strm: exited with code $EXIT_CODE"
 }
 
 # Extract counts from output

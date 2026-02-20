@@ -9,3 +9,4 @@ subtitles/
 venv/
 ffprobe_failures.log
 *.log
+.plex_strm.lock
