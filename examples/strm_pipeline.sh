@@ -18,6 +18,11 @@ LOCKFILE="/tmp/strm_pipeline.lock"
 # ── Configuration (set these for your environment) ────────────
 export PLEX_TOKEN="YOUR_PLEX_TOKEN"
 export PLEX_URL="http://localhost:32400"
+ENABLE_SCAN_GUARD="${ENABLE_SCAN_GUARD:-1}"
+USE_TIMEOUTS="${USE_TIMEOUTS:-0}"
+MAX_PLEX_STRM_TIME="${MAX_PLEX_STRM_TIME:-270}"
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || true)}"
+TIMEOUT_BIN="${TIMEOUT_BIN:-$(command -v gtimeout || command -v timeout || true)}"
 
 # PostgreSQL config
 export PLEX_PG_HOST=localhost
@@ -61,6 +66,15 @@ fi
 
 log "=== Pipeline start ==="
 
+if [ -z "$PYTHON_BIN" ]; then
+    log "ERROR: python3 not found"
+    exit 1
+fi
+if [ "$USE_TIMEOUTS" = "1" ] && [ -z "$TIMEOUT_BIN" ]; then
+    log "ERROR: USE_TIMEOUTS=1 but no timeout binary found"
+    exit 1
+fi
+
 # ── Pre-check: is Zurg up? ────────────────────────────────────
 if ! curl -s -o /dev/null -w '' --max-time 5 "$ZURG_URL/dav/" 2>/dev/null; then
     log "SKIP: Zurg not responding"
@@ -69,7 +83,8 @@ if ! curl -s -o /dev/null -w '' --max-time 5 "$ZURG_URL/dav/" 2>/dev/null; then
 fi
 
 # Skip while Plex is still scanning STRM libraries.
-SCAN_ACTIVE=$(python3 - <<'PY'
+if [ "$ENABLE_SCAN_GUARD" = "1" ]; then
+SCAN_ACTIVE=$("$PYTHON_BIN" - <<'PY'
 import os, urllib.request, urllib.parse, xml.etree.ElementTree as ET
 url = os.environ.get("PLEX_URL", "http://localhost:32400")
 token = os.environ.get("PLEX_TOKEN", "")
@@ -93,6 +108,7 @@ if [ "$SCAN_ACTIVE" = "1" ]; then
     log "=== Pipeline done (skipped) ==="
     exit 0
 fi
+fi
 
 # ── Step 1: plex_strm.py ──────────────────────────────────────
 log "Step 1: Running plex_strm.py (new items only)"
@@ -102,7 +118,13 @@ for name in "${LIBRARY_NAMES[@]}"; do
     LIB_ARGS="$LIB_ARGS --library \"$name\""
 done
 
-PLEX_STRM_OUT=$(python3 "$PLEX_STRM_PY" --pg \
+if [ "$USE_TIMEOUTS" = "1" ]; then
+    PLEX_CMD=("$TIMEOUT_BIN" "$MAX_PLEX_STRM_TIME" "$PYTHON_BIN" "$PLEX_STRM_PY" --pg)
+else
+    PLEX_CMD=("$PYTHON_BIN" "$PLEX_STRM_PY" --pg)
+fi
+
+PLEX_STRM_OUT=$(${PLEX_CMD[@]} \
     $LIB_ARGS \
     update --protect --workers 4 --timeout 30 --retries 2 \
     --zurg-url "$ZURG_URL" \

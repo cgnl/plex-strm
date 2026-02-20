@@ -60,6 +60,7 @@ For a production-style setup with STRM fallback, use the bundled examples:
 - `examples/Caddyfile` — Plex + `/strm/*` split routing
 - `examples/docker-compose.strm-stack.yml` — runs `strm_proxy` + Caddy
 - `strm_proxy.py` — tries alternative STRM IDs on Zurg 5XX and triggers repair
+- `examples/strm_pipeline.sh` — automation wrapper (scan guard + optional timeout knobs)
 
 This way both Plex and Zurg share the same domain. Clients requesting `/strm/*` hit Zurg directly, everything else goes to Plex.
 
@@ -231,6 +232,14 @@ plex-strm update --pg --reanalyze 2 --workers 8
 | `LOCAL_FALLBACK_MATCH_MODE` | Strictness mode: `all`, `av`, or `audio` (default `all`) |
 | `LOCAL_FALLBACK_RESOLUTION_PREFERENCE` | Fallback ranking: `1080p`, `balanced`, `4k` (default `1080p`) |
 | `PLEX_TOKEN` | Plex token used for local fallback `/library/parts/...` redirect |
+
+### Pipeline example knobs
+
+| Variable | Description |
+|----------|-------------|
+| `ENABLE_SCAN_GUARD` | In `examples/strm_pipeline.sh`, skip run when STRM library scans are active (`1` default) |
+| `USE_TIMEOUTS` | Enable command timeouts in `examples/strm_pipeline.sh` (`0` default) |
+| `MAX_PLEX_STRM_TIME` | Timeout seconds for `plex_strm.py` when `USE_TIMEOUTS=1` (default `270`) |
 
 ### URL rewriting
 
