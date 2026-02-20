@@ -10,14 +10,25 @@ services:
       ZURG_USER: ${ZURG_USER}
       ZURG_PASS: ${ZURG_PASS}
       PROXY_PORT: "8765"
+      PLEX_DB_MODE: ${PLEX_DB_MODE:-postgres}
+      PLEX_SQLITE_PATH: ${PLEX_SQLITE_PATH:-/data/com.plexapp.plugins.library.db}
       PLEX_PG_HOST: ${PLEX_PG_HOST:-host.docker.internal}
       PLEX_PG_PORT: ${PLEX_PG_PORT:-5432}
       PLEX_PG_DATABASE: ${PLEX_PG_DATABASE:-plex}
       PLEX_PG_USER: ${PLEX_PG_USER:-plex}
       PLEX_PG_PASSWORD: ${PLEX_PG_PASSWORD:-plex}
       PLEX_PG_SCHEMA: ${PLEX_PG_SCHEMA:-plex}
+      ENABLE_LOCAL_FALLBACK: ${ENABLE_LOCAL_FALLBACK:-1}
+      LOCAL_FALLBACK_STRICT: ${LOCAL_FALLBACK_STRICT:-1}
+      LOCAL_FALLBACK_MATCH_MODE: ${LOCAL_FALLBACK_MATCH_MODE:-audio}
+      LOCAL_FALLBACK_RESOLUTION_PREFERENCE: ${LOCAL_FALLBACK_RESOLUTION_PREFERENCE:-1080p}
+      PLEX_TOKEN: ${PLEX_TOKEN:-}
     ports:
       - "8765:8765"
+    # For SQLite mode, mount the Plex DB file into the container path set in
+    # PLEX_SQLITE_PATH. Example:
+    # volumes:
+    #   - "/Users/you/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db:/data/com.plexapp.plugins.library.db:ro"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
