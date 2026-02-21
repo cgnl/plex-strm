@@ -102,7 +102,7 @@ This rewrites all STRM URLs to `https://myuser:mypassword@plex.example.com/strm/
 Running Zurg on a dedicated server has significant advantages:
 
 - **Single IP to Real-Debrid** — RD can flag accounts that access from multiple IPs. A dedicated server ensures only one IP ever contacts RD.
-- **Better peering** — Hetzner, OVH, and other EU hosters often have better peering to RD's CDN nodes than residential connections.
+- **Faster uplink** — Dedicated servers typically have 1–10 Gbit/s symmetric connections with better routing to RD's CDN nodes than residential ISPs.
 - **Always-on** — No need to keep a local machine running for Zurg.
 
 **Architecture:**
