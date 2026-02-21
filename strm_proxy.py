@@ -33,6 +33,7 @@ ZURG_URL = os.environ.get("ZURG_URL", "http://localhost:9091")
 ZURG_USER = os.environ.get("ZURG_USER", "")
 ZURG_PASS = os.environ.get("ZURG_PASS", "")
 LISTEN_PORT = int(os.environ.get("PROXY_PORT", "8765"))
+LISTEN_HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
 
 PG_HOST = os.environ.get("PLEX_PG_HOST", "localhost")
 PG_PORT = os.environ.get("PLEX_PG_PORT", "5432")
@@ -43,7 +44,7 @@ PG_SCHEMA = os.environ.get("PLEX_PG_SCHEMA", "plex")
 PLEX_DB_MODE = os.environ.get("PLEX_DB_MODE", "postgres").strip().lower()
 PLEX_SQLITE_PATH = os.environ.get(
     "PLEX_SQLITE_PATH",
-    "/Users/sander/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db",
+    "",
 )
 
 if PLEX_DB_MODE not in ("postgres", "sqlite"):
@@ -70,6 +71,7 @@ LOCAL_FALLBACK_RESOLUTION_PREFERENCE = os.environ.get(
 PLEX_FALLBACK_TOKEN = os.environ.get("PLEX_TOKEN", "")
 FOLLOW_RD_REDIRECTS = os.environ.get("FOLLOW_RD_REDIRECTS", "0").lower() in ("1", "true", "yes", "on")
 STREAM_CHUNK_SIZE = max(64 * 1024, int(os.environ.get("STREAM_CHUNK_SIZE", str(1024 * 1024))))
+ZURG_TIMEOUT = max(5, int(os.environ.get("ZURG_TIMEOUT", "45")))
 
 # Cache broken STRM IDs (avoid repeated 500s to Zurg)
 BROKEN_CACHE_TTL = 300  # seconds
@@ -184,11 +186,11 @@ def find_alternatives(strm_id: str):
 
         # Step 1: Find ALL metadata_item_ids for this STRM ID
         # (same URL can appear under multiple metadata_items, e.g. movie + extra)
-        cur.execute("""
+        cur.execute(f"""
             SELECT DISTINCT mi.metadata_item_id
             FROM media_parts mp
             JOIN media_items mi ON mi.id = mp.media_item_id
-            WHERE mp.file LIKE %s
+            WHERE mp.file LIKE {DB_PARAM}
         """, (f"%/strm/{strm_id}",))
 
         meta_ids = [r[0] for r in cur.fetchall()]
@@ -242,7 +244,7 @@ def find_local_fallback_part(strm_id: str):
 
         # Source metadata IDs + GUIDs for this STRM ID
         cur.execute(
-            """
+            f"""
             SELECT DISTINCT
                    mi.id AS media_item_id,
                    mi.metadata_item_id,
@@ -256,7 +258,7 @@ def find_local_fallback_part(strm_id: str):
             FROM media_parts mp
             JOIN media_items mi ON mi.id = mp.media_item_id
             JOIN metadata_items mdi ON mdi.id = mi.metadata_item_id
-            WHERE mp.file LIKE %s
+            WHERE mp.file LIKE {DB_PARAM}
             """,
             (f"%/strm/{strm_id}",),
         )
@@ -526,7 +528,7 @@ def try_zurg(strm_id: str):
             auth=zurg_auth(),
             allow_redirects=False,
             headers=headers,
-            timeout=10,
+            timeout=ZURG_TIMEOUT,
         )
         if resp.status_code >= 500:
             return None
@@ -545,7 +547,7 @@ def _proxy_rd_redirect(upstream_resp):
         return None
     if upstream_resp.status_code not in (301, 302, 303, 307, 308):
         return None
-    if "download.real-debrid.com" not in location:
+    if "download.real-debrid" not in location:
         return None
 
     headers = {}
@@ -601,6 +603,28 @@ def _build_client_response(upstream_resp):
         headers.pop(h, None)
     body = b"" if request.method == "HEAD" else upstream_resp.content
     return Response(body, status=upstream_resp.status_code, headers=headers)
+
+
+
+@app.route("/strm/health")
+def health():
+    # Health check endpoint. Does NOT proxy to Zurg /strm/health.
+    try:
+        conn = get_pg()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.close()
+        conn.close()
+        db_ok = True
+    except Exception:
+        db_ok = False
+    try:
+        resp = HTTP.get(f"{ZURG_URL}/", auth=zurg_auth(), timeout=5)
+        zurg_ok = resp.status_code < 500
+    except Exception:
+        zurg_ok = False
+    status_code = 200 if (db_ok and zurg_ok) else 503
+    return {"status": "ok" if status_code == 200 else "degraded", "db": db_ok, "zurg": zurg_ok}, status_code
 
 
 @app.route("/strm/<strm_id>", methods=["GET", "HEAD"])
@@ -677,7 +701,7 @@ def proxy_other(path):
             f"{ZURG_URL}/strm/{path}",
             auth=zurg_auth(),
             allow_redirects=False,
-            timeout=10,
+            timeout=ZURG_TIMEOUT,
         )
         headers = dict(resp.headers)
         for h in ("transfer-encoding", "connection", "keep-alive"):
@@ -700,4 +724,4 @@ if __name__ == "__main__":
     )
     log.info("Local fallback match mode: %s", LOCAL_FALLBACK_MATCH_MODE)
     log.info("Local fallback resolution preference: %s", LOCAL_FALLBACK_RESOLUTION_PREFERENCE)
-    app.run(host="127.0.0.1", port=LISTEN_PORT, threaded=True)
+    app.run(host=LISTEN_HOST, port=LISTEN_PORT, threaded=True)

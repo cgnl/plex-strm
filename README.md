@@ -21,6 +21,8 @@ Supports both **SQLite** and **PostgreSQL** ([plex-postgresql](https://github.co
 
 [Zurg](https://github.com/debridmediamanager/zurg-testing) can generate `.strm` files with `save_strm_files: true` in its config. These files contain URLs like `http://localhost:9091/strm/<id>` that redirect to Real-Debrid download links.
 
+> **Important:** The `/strm/<id>` endpoint and `save_strm_files` feature require a **Zurg sponsor (nightly) build**. The public release (v0.9.3-final) does not include this endpoint. You need to be a [GitHub sponsor](https://github.com/sponsors/debridmediamanager) to access nightly builds.
+
 **The problem:** Plex doesn't proxy HTTP URLs — it sends a 302 redirect to the client. If the URL contains `localhost`, remote clients can't reach it.
 
 **The solution:** Use `--base-url` to rewrite URLs to a publicly reachable address:
@@ -94,6 +96,124 @@ plex-strm update --pg --protect \
 This rewrites all STRM URLs to `https://myuser:mypassword@plex.example.com/strm/...`. Plex stores the full URL in the database and sends the credentials when streaming.
 
 > **Note:** Plex's built-in player (Lavf) does not send `Authorization` headers from the URL — it only works when credentials are embedded as `user:pass@host` in the URL itself. This is why `--base-url` includes the credentials rather than relying on header-based auth.
+
+### Running Zurg on a remote server (dedicated server / VPS)
+
+Running Zurg on a dedicated server has significant advantages:
+
+- **Single IP to Real-Debrid** — RD can flag accounts that access from multiple IPs. A dedicated server ensures only one IP ever contacts RD.
+- **Better peering** — Hetzner, OVH, and other EU hosters often have better peering to RD's CDN nodes than residential connections.
+- **Always-on** — No need to keep a local machine running for Zurg.
+
+**Architecture:**
+
+```
+Plex (local) → strm_proxy (remote) → Zurg (remote) → Real-Debrid CDN
+                    ↓ (fallback)
+              Plex local files
+```
+
+The `strm_proxy.py` sits between your reverse proxy and Zurg. When Zurg returns a 5XX (expired/broken link), it looks up alternative STRM IDs for the same content in the Plex database and tries them. If all STRM versions fail, it can fall back to local files.
+
+**Setup on the remote server:**
+
+1. Deploy Zurg + strm_proxy + Caddy via Docker Compose (see `examples/docker-compose.strm-stack.yml`)
+2. Point strm_proxy at your Plex PostgreSQL database (expose PostgreSQL to the remote server via VPN/Tailscale)
+3. Set `FOLLOW_RD_REDIRECTS=1` so the proxy streams bytes instead of exposing RD CDN URLs to clients
+4. Use `save_strm_files: true` in Zurg config and sync the generated `.strm` files to your local machine (e.g. rsync over Tailscale every 5 minutes)
+
+**Zurg config for remote deployment:**
+
+```yaml
+# /opt/rd-stack/zurg/config.yml
+zurg: v1
+token: YOUR_RD_API_TOKEN
+port: 9091
+base_url: https://user:pass@strm.example.com
+
+save_strm_files: true
+serve_from_rd: true
+enable_repair: true
+repair_every_mins: 180
+delete_error_torrents: true
+
+directories:
+  shows:
+    group: media
+    group_order: 10
+    only_show_files_with_size_gte: 157286400
+    filters:
+      - has_episodes: true
+  movies:
+    group: media
+    group_order: 20
+    only_show_the_biggest_file: true
+    only_show_files_with_size_gte: 157286400
+    filters:
+      - regex: /.*/
+```
+
+**Docker Compose for the remote stack:**
+
+```yaml
+services:
+  zurg:
+    image: your-zurg-nightly-image
+    volumes:
+      - ./zurg/config.yml:/app/config.yml
+      - ./zurg/data:/app/data
+    restart: unless-stopped
+
+  strm-proxy:
+    build: ./strm-proxy
+    environment:
+      - ZURG_URL=http://zurg:9091
+      - ZURG_USER=user
+      - ZURG_PASS=pass
+      - FOLLOW_RD_REDIRECTS=1
+      - STREAM_CHUNK_SIZE=4194304
+      - ZURG_TIMEOUT=45
+      - PLEX_DB_MODE=postgres
+      - PLEX_PG_HOST=your-plex-db-host   # e.g. Tailscale IP
+      - PLEX_PG_PORT=5432
+      - PLEX_PG_DATABASE=plex
+      - PLEX_PG_USER=plex
+      - PLEX_PG_PASSWORD=plex
+      - PLEX_PG_SCHEMA=plex
+      - PLEX_TOKEN=your-plex-token
+      - ENABLE_LOCAL_FALLBACK=1
+    depends_on:
+      - zurg
+    restart: unless-stopped
+
+  caddy:
+    image: ghcr.io/caddybuilds/caddy-cloudflare:latest
+    ports:
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/data:/data
+    depends_on:
+      - strm-proxy
+    restart: unless-stopped
+```
+
+**Performance tips for remote Zurg:**
+
+- **TCP tuning** on the remote server is critical for high-latency links. Set BBR congestion control and increase TCP buffers:
+  ```bash
+  # /etc/sysctl.d/99-tcp-tuning.conf
+  net.core.rmem_max = 16777216
+  net.core.wmem_max = 16777216
+  net.ipv4.tcp_rmem = 4096 1048576 16777216
+  net.ipv4.tcp_wmem = 4096 1048576 16777216
+  net.core.default_qdisc = fq
+  net.ipv4.tcp_congestion_control = bbr
+  net.ipv4.tcp_mtu_probing = 1
+  ```
+- **Force HTTP/1.1** in Caddy (`protocols h1`) — HTTP/2 multiplexes all streams over one TCP connection, which limits throughput on high-latency links. HTTP/1.1 gives each stream its own connection.
+- **Gunicorn** instead of Flask dev server for strm_proxy — use gthread workers for concurrent stream handling (see `strm-proxy/Dockerfile` example).
+- **IPv6** — if your server has IPv6 and RD supports it, enable `force_ipv6: true` in Zurg config to avoid IPv4 NAT overhead.
 
 ## Project structure
 
@@ -225,6 +345,7 @@ plex-strm update --pg --reanalyze 2 --workers 8
 | `ZURG_USER` | Zurg basic auth username (optional) |
 | `ZURG_PASS` | Zurg basic auth password (optional) |
 | `PROXY_PORT` | `strm_proxy.py` listen port (default: `8765`) |
+| `PROXY_HOST` | `strm_proxy.py` listen address (default: `0.0.0.0`) |
 | `PLEX_DB_MODE` | DB mode for `strm_proxy.py` and `repair_broken.py`: `postgres` or `sqlite` (default: `postgres`) |
 | `PLEX_SQLITE_PATH` | Plex SQLite DB path when `PLEX_DB_MODE=sqlite` |
 | `ENABLE_LOCAL_FALLBACK` | Enable local file fallback in `strm_proxy.py` (`1`/`0`, default `1`) |
@@ -232,6 +353,9 @@ plex-strm update --pg --reanalyze 2 --workers 8
 | `LOCAL_FALLBACK_MATCH_MODE` | Strictness mode: `all`, `av`, or `audio` (default `all`) |
 | `LOCAL_FALLBACK_RESOLUTION_PREFERENCE` | Fallback ranking: `1080p`, `balanced`, `4k` (default `1080p`) |
 | `PLEX_TOKEN` | Plex token used for local fallback `/library/parts/...` redirect |
+| `FOLLOW_RD_REDIRECTS` | Proxy RD CDN bytes instead of exposing redirect URLs (`1`/`0`, default `0`) |
+| `STREAM_CHUNK_SIZE` | Chunk size in bytes for proxied streams (default: `1048576` = 1MB) |
+| `ZURG_TIMEOUT` | Timeout in seconds for requests to Zurg (default: `45`) |
 
 ### Pipeline example knobs
 
