@@ -1,10 +1,14 @@
 # Zurg config optimized for plex-strm STRM streaming setup.
 #
+# IMPORTANT: The /strm/<id> endpoint and save_strm_files require a Zurg
+# sponsor (nightly) build. The public release (v0.9.3-final) does not
+# include this. See: https://github.com/sponsors/debridmediamanager
+#
 # Key design decisions:
 #   - serve_from_rd: true  -> Zurg returns 307 redirects to RD CDN (no proxying)
 #   - save_strm_files: true -> Zurg generates .strm files for Plex
 #   - on_library_update triggers the pipeline on every torrent change
-#   - restrict_repair_to_cached avoids wasting credits on uncached repairs
+#   - delete_error_torrents cleans up dead torrents automatically
 #   - Small network_buffer_size since Zurg only sends redirects, not data
 
 zurg: v1
@@ -18,12 +22,13 @@ on_library_update: /path/to/strm_pipeline.sh
 # Poll RD for changes (backup for on_library_update)
 check_for_changes_every_secs: 60
 
-# Repair
+# Repair: automatically fix broken RD links
 enable_repair: true
-repair_every_mins: 120
-restrict_repair_to_cached: true
+repair_every_mins: 180
 
+# Auto-cleanup
 auto_delete_rar_torrents: true
+delete_error_torrents: true
 
 # Rate limits (RD enforces ~120 API calls/min)
 api_rate_limit_per_minute: 120
@@ -32,7 +37,7 @@ torrents_rate_limit_per_minute: 60
 cache_network_test_results: true
 retries_until_failed: 5
 retry_503_errors: true
-delete_error_torrents: false
+hide_broken_torrents: false
 
 # 16 workers is safe for RD rate limits
 concurrent_workers: 16
@@ -48,6 +53,9 @@ prefetch: false
 
 serve_from_rd: true
 save_strm_files: true
+
+# Optional: force IPv6 if your server supports it (avoids IPv4 NAT overhead)
+# force_ipv6: true
 
 directories:
   shows:

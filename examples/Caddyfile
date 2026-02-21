@@ -2,20 +2,30 @@
 #
 # Flow:
 #   Client -> Caddy :443
-#      /strm/* -> strm_proxy :8765 -> Zurg :9091 -> RD CDN (307 redirect)
+#      /strm/* -> strm_proxy :8765 -> Zurg :9091 -> RD CDN
 #      all else -> Plex :32400
 #
 # Requirements:
 #   - CLOUDFLARE_API_TOKEN env var (for DNS challenge)
-#   - strm_proxy.py running on localhost:8765
-#   - Zurg running on localhost:9091
-#   - Plex running on localhost:32400
+#   - strm_proxy.py running on port 8765
+#   - Zurg running on port 9091
+#   - Plex running on port 32400
+#
+# Performance notes:
+#   - "protocols h1" forces HTTP/1.1 between Caddy and clients. HTTP/2
+#     multiplexes all streams over 1 TCP connection, which limits throughput
+#     on high-latency links. HTTP/1.1 gives each stream its own connection.
+#   - read/write_buffer 4MB matches the STREAM_CHUNK_SIZE for efficient proxying.
+
+{
+    servers {
+        protocols h1
+    }
+}
 
 your-plex-domain.example.com {
     tls {
-        dns cloudflare {
-            api_token {env.CLOUDFLARE_API_TOKEN}
-        }
+        dns cloudflare {env.CLOUDFLARE_API_TOKEN}
         resolvers 1.1.1.1 8.8.8.8
         propagation_timeout 5m
         propagation_delay 30s
@@ -51,12 +61,17 @@ your-plex-domain.example.com {
         remote_ip 192.168.0.0/16 172.16.0.0/12 10.0.0.0/8 127.0.0.1
     }
     handle @strm_lan {
-        reverse_proxy 127.0.0.1:8765 {
+        reverse_proxy strm-proxy:8765 {
             header_up X-Real-IP {remote_host}
             flush_interval -1
             transport http {
+                versions 1.1
+                read_buffer 4194304
+                write_buffer 4194304
                 read_timeout 6000s
                 write_timeout 6000s
+                keepalive 120s
+                keepalive_idle_conns 128
             }
         }
     }
@@ -67,18 +82,28 @@ your-plex-domain.example.com {
         basic_auth {
             zurg REPLACE_WITH_BCRYPT_HASH
         }
-        reverse_proxy 127.0.0.1:8765 {
+        reverse_proxy strm-proxy:8765 {
             header_up X-Real-IP {remote_host}
             flush_interval -1
             transport http {
+                versions 1.1
+                read_buffer 4194304
+                write_buffer 4194304
                 read_timeout 6000s
                 write_timeout 6000s
+                keepalive 120s
+                keepalive_idle_conns 128
             }
         }
     }
 
+    # strm_proxy status endpoint (no auth, internal use)
+    handle /strm_proxy/* {
+        reverse_proxy strm-proxy:8765
+    }
+
     # Everything else goes to Plex
-    reverse_proxy 127.0.0.1:32400 {
+    reverse_proxy host.docker.internal:32400 {
         header_up X-Real-IP {remote_host}
         header_up X-Forwarded-For {remote_host}
         header_up X-Plex-Client-IP {remote_host}

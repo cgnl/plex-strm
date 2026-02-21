@@ -3,13 +3,16 @@ services:
   strm-proxy:
     build:
       context: ..
-      dockerfile: Dockerfile
-    command: ["python", "strm_proxy.py"]
+      dockerfile: examples/Dockerfile.strm-proxy
     environment:
       ZURG_URL: http://host.docker.internal:9091
       ZURG_USER: ${ZURG_USER}
       ZURG_PASS: ${ZURG_PASS}
       PROXY_PORT: "8765"
+      PROXY_HOST: "0.0.0.0"
+      FOLLOW_RD_REDIRECTS: ${FOLLOW_RD_REDIRECTS:-0}
+      STREAM_CHUNK_SIZE: ${STREAM_CHUNK_SIZE:-4194304}
+      ZURG_TIMEOUT: ${ZURG_TIMEOUT:-45}
       PLEX_DB_MODE: ${PLEX_DB_MODE:-postgres}
       PLEX_SQLITE_PATH: ${PLEX_SQLITE_PATH:-/data/com.plexapp.plugins.library.db}
       PLEX_PG_HOST: ${PLEX_PG_HOST:-host.docker.internal}
@@ -37,11 +40,10 @@ services:
   #   /strm/* -> strm-proxy
   #   everything else -> Plex on host
   caddy:
-    image: caddy-dns/cloudflare:2.8.4
+    image: ghcr.io/caddybuilds/caddy-cloudflare:latest
     depends_on:
       - strm-proxy
     ports:
-      - "80:80"
       - "443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro

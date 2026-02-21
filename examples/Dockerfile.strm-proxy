@@ -1,0 +1,25 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY examples/requirements.strm-proxy.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY strm_proxy.py ./
+
+ENV PYTHONUNBUFFERED=1
+
+# Gunicorn: 4 gthread workers x 4 threads = 16 concurrent streams.
+# Much faster than Flask dev server for proxying RD streams.
+CMD ["gunicorn", \
+     "--bind", "0.0.0.0:8765", \
+     "--workers", "4", \
+     "--worker-class", "gthread", \
+     "--threads", "4", \
+     "--timeout", "600", \
+     "--graceful-timeout", "300", \
+     "--keep-alive", "120", \
+     "--access-logfile", "-", \
+     "--error-logfile", "-", \
+     "--log-level", "info", \
+     "strm_proxy:app"]
