@@ -36,7 +36,7 @@ ZURG_BASE = "http://localhost:9091"
 ZURG_USER = os.environ.get("ZURG_USER", "")
 ZURG_PASS = os.environ.get("ZURG_PASS", "")
 ZURG_AUTH = base64.b64encode(f"{ZURG_USER}:{ZURG_PASS}".encode()).decode() if ZURG_USER else ""
-ZURG_DATA_DIR = "/Users/sander/bin/zurg/data"
+ZURG_DATA_DIR = os.environ.get("ZURG_DATA_DIR", "/Users/sander/bin/zurg/data")
 
 PLEX_DB_MODE = os.environ.get("PLEX_DB_MODE", "postgres").strip().lower()
 PLEX_SQLITE_PATH = os.environ.get(
@@ -44,7 +44,7 @@ PLEX_SQLITE_PATH = os.environ.get(
     "/Users/sander/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db",
 )
 
-PSQL = "/opt/homebrew/Cellar/postgresql@15/15.15/bin/psql"
+PSQL = os.environ.get("PSQL_PATH", "/opt/homebrew/Cellar/postgresql@15/15.15/bin/psql")
 PG_CONN = ["-h", "localhost", "-U", "plex", "-d", "plex"]
 PG_SCHEMA = os.environ.get("PLEX_PG_SCHEMA", "plex")
 
@@ -119,6 +119,10 @@ def build_index():
     hash_to_state = {}
     hash_to_rd_ids = {}  # hash -> [rd_id, ...]
 
+    if not os.path.isdir(ZURG_DATA_DIR):
+        log.warning("ZURG_DATA_DIR does not exist: %s", ZURG_DATA_DIR)
+        return rd_to_hash, hash_to_name, hash_to_state, hash_to_rd_ids
+
     for fname in os.listdir(ZURG_DATA_DIR):
         if not fname.endswith('.zurgtorrent'):
             continue
@@ -161,7 +165,7 @@ def get_broken_rd_ids():
         """)
     else:
         raw = pg_query(f"""
-            SELECT DISTINCT regexp_replace(mp.file, '.*/strm/', '')
+            SELECT DISTINCT split_part(regexp_replace(mp.file, '.*/strm/', ''), '/', 1)
             FROM {t('media_items')} mi
             JOIN {t('media_parts')} mp ON mp.media_item_id = mi.id
             WHERE mp.file LIKE 'http%%' AND mi.media_analysis_version = -1

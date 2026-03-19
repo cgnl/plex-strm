@@ -145,6 +145,7 @@ def cmd_update(args):
 
         # Replace .strm paths with direct URLs
         url_mapping = {}  # media_item_id -> url
+        part_id_map = {}  # media_item_id -> part_id
         updated = 0
 
         if not strm_rows:
@@ -188,6 +189,7 @@ def cmd_update(args):
                            (direct_url, row["id"]))
 
             url_mapping[row["media_item_id"]] = direct_url
+            part_id_map[row["media_item_id"]] = row["id"]
             updated += 1
 
             if updated % 50 == 0:
@@ -314,7 +316,8 @@ def cmd_update(args):
 
             analyzed = 0
             failed = 0
-            failed_items = []
+            failed_items = []       # [(mid, url), ...] — all failures
+            permanent_fails = set() # mids with permanent (non-retryable) failures
             analyzed_mids = []
             t0 = time.time()
 
@@ -392,9 +395,10 @@ def cmd_update(args):
                                 meta, retryable = None, True
 
                             if meta:
+                                pid = part_id_map.get(mid)
                                 update_media_item(db, mid, dict(meta))
-                                update_media_part(db, mid, dict(meta))
-                                create_media_streams(db, mid, dict(meta))
+                                update_media_part(db, mid, dict(meta), part_id=pid)
+                                create_media_streams(db, mid, dict(meta), part_id=pid)
                                 analyzed += 1
                                 analyzed_mids.append(mid)
                             elif retryable and pass_num < retries:
@@ -402,6 +406,8 @@ def cmd_update(args):
                             else:
                                 failed += 1
                                 failed_items.append((mid, url_mapping.get(mid, url)))
+                                if not retryable:
+                                    permanent_fails.add(mid)
 
                     db.commit()
 
@@ -509,9 +515,10 @@ def cmd_update(args):
                             except Exception:
                                 meta = None
                             if meta:
+                                pid = part_id_map.get(mid)
                                 update_media_item(db, mid, dict(meta))
-                                update_media_part(db, mid, dict(meta), retry_mapping.get(mid))
-                                create_media_streams(db, mid, dict(meta))
+                                update_media_part(db, mid, dict(meta), part_id=pid)
+                                create_media_streams(db, mid, dict(meta), part_id=pid)
                                 retry_ok += 1
                                 analyzed += 1
                                 analyzed_mids.append(mid)
@@ -525,13 +532,16 @@ def cmd_update(args):
                     log.info("Post-repair retry: %d recovered, %d still failed",
                              retry_ok, retry_fail)
 
-            # Mark permanently failed items (5XX) so they're skipped next run
+            # Mark permanently failed items so they're skipped next run
             # media_analysis_version = -1 means "broken source, don't retry"
-            if failed_items:
+            # Only mark items with permanent errors (404, 403, etc.), NOT transient failures
+            permanent_failed = [(mid, url) for mid, url in failed_items if mid in permanent_fails]
+            transient_failed = len(failed_items) - len(permanent_failed)
+            if permanent_failed:
                 ph = "%s" if db.is_pg else "?"
                 cur = db.cursor()
                 marked = 0
-                for mid, url in failed_items:
+                for mid, url in permanent_failed:
                     db.execute(cur,
                         f"UPDATE media_items SET media_analysis_version = -1 WHERE id = {ph}",
                         (mid,))
@@ -539,8 +549,10 @@ def cmd_update(args):
                 db.commit()
                 cur.close()
                 if marked:
-                    log.info("Marked %d failed items with media_analysis_version=-1 (skipped next run)",
+                    log.info("Marked %d permanently failed items with version=-1 (skipped next run)",
                              marked)
+            if transient_failed:
+                log.info("%d items failed transiently — will be retried next run", transient_failed)
 
                 fail_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffprobe_failures.log")
                 with open(fail_log, "w", encoding="utf-8") as f:

@@ -10,6 +10,18 @@ from datetime import datetime
 log = logging.getLogger("plex-strm")
 
 
+def _is_connection_error(exc):
+    """Check if an exception indicates a lost PostgreSQL connection."""
+    try:
+        import psycopg2
+        if isinstance(exc, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+            return True
+    except ImportError:
+        pass
+    msg = str(exc).lower()
+    return any(s in msg for s in ("connection", "closed", "terminated", "broken pipe", "eof"))
+
+
 class PlexDB:
     """Thin abstraction over SQLite and PostgreSQL connections."""
 
@@ -92,11 +104,26 @@ class PlexDB:
         return f"[{name}]"
 
     def execute(self, cur, sql, params=None):
-        """Execute SQL with the right placeholder style."""
-        if params:
-            cur.execute(sql, params)
-        else:
-            cur.execute(sql)
+        """Execute SQL with the right placeholder style.
+
+        For PostgreSQL, automatically reconnects on connection loss and retries once.
+        """
+        try:
+            if params is not None:
+                cur.execute(sql, params)
+            else:
+                cur.execute(sql)
+        except Exception as e:
+            if self.is_pg and _is_connection_error(e):
+                log.warning("Connection lost during execute, reconnecting...")
+                self.ensure_connected()
+                cur = self.conn.cursor()
+                if params is not None:
+                    cur.execute(sql, params)
+                else:
+                    cur.execute(sql)
+            else:
+                raise
 
     def fetchall(self, cur):
         """Fetch all rows as dicts."""

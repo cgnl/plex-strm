@@ -8,6 +8,37 @@ import time
 log = logging.getLogger("plex-strm")
 
 
+def _request_with_retry(method, url, max_retries=3, **kwargs):
+    """HTTP request with exponential backoff and 429/5xx retry."""
+    import requests
+    kwargs.setdefault("timeout", 30)
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 5))
+                wait = min(retry_after, 60)
+                log.debug("OpenSubtitles 429, waiting %ds (attempt %d)", wait, attempt + 1)
+                time.sleep(wait)
+                continue
+            if resp.status_code >= 500 and attempt < max_retries:
+                wait = min(2 ** attempt, 30)
+                log.debug("OpenSubtitles %d, retrying in %ds (attempt %d)",
+                          resp.status_code, wait, attempt + 1)
+                time.sleep(wait)
+                continue
+            return resp
+        except Exception:
+            if attempt < max_retries:
+                wait = min(2 ** attempt, 30)
+                log.debug("OpenSubtitles request error, retrying in %ds (attempt %d)",
+                          wait, attempt + 1)
+                time.sleep(wait)
+            else:
+                raise
+    return resp
+
+
 def clean_title_for_search(title):
     """Clean a title for OpenSubtitles search.
 
@@ -74,8 +105,12 @@ def subtitle_search(api_key, token, imdb_id=None, tmdb_id=None, title=None, year
     else:
         return []
 
-    resp = requests.get("https://api.opensubtitles.com/api/v1/subtitles",
-                        headers=headers, params=params, timeout=30)
+    try:
+        resp = _request_with_retry("GET", "https://api.opensubtitles.com/api/v1/subtitles",
+                                   headers=headers, params=params)
+    except Exception as e:
+        log.debug("OpenSubtitles search error: %s", e)
+        return []
     if resp.status_code != 200:
         log.debug("OpenSubtitles search failed: %d", resp.status_code)
         return []
@@ -117,17 +152,22 @@ def subtitle_download(api_key, token, file_id, output_path):
         "Content-Type": "application/json",
         "User-Agent": "plex-strm/1.0",
     }
-    resp = requests.post("https://api.opensubtitles.com/api/v1/download",
-                         headers=headers,
-                         json={"file_id": int(file_id), "sub_format": "srt"},
-                         timeout=30)
+    try:
+        resp = _request_with_retry("POST", "https://api.opensubtitles.com/api/v1/download",
+                                   headers=headers,
+                                   json={"file_id": int(file_id), "sub_format": "srt"})
+    except Exception:
+        return False
     if resp.status_code != 200:
         return False
     link = resp.json().get("link")
     if not link:
         return False
 
-    resp = requests.get(link, timeout=60)
+    try:
+        resp = _request_with_retry("GET", link, timeout=60)
+    except Exception:
+        return False
     if resp.status_code != 200:
         return False
 
@@ -140,11 +180,13 @@ def subtitle_download(api_key, token, file_id, output_path):
 def opensub_login(api_key, username, password):
     """Login to OpenSubtitles, return token or None."""
     import requests
-    resp = requests.post("https://api.opensubtitles.com/api/v1/login",
-                         headers={"Api-Key": api_key, "Content-Type": "application/json",
-                                  "User-Agent": "plex-strm/1.0"},
-                         json={"username": username, "password": password},
-                         timeout=30)
+    try:
+        resp = _request_with_retry("POST", "https://api.opensubtitles.com/api/v1/login",
+                                   headers={"Api-Key": api_key, "Content-Type": "application/json",
+                                            "User-Agent": "plex-strm/1.0"},
+                                   json={"username": username, "password": password})
+    except Exception:
+        return None
     if resp.status_code == 200:
         return resp.json().get("token")
     return None
@@ -383,7 +425,7 @@ def download_subtitles(db, media_item_ids, mode="missing"):
             if not results:
                 continue
 
-            fname = f"{safe_title}.{lang}.srt"
+            fname = f"{safe_title}.{mid}.{lang}.srt"
             fpath = os.path.join(sub_dir, fname)
             if os.path.exists(fpath) and mode == "missing":
                 log.debug("Subtitle already exists on disk: %s", fpath)

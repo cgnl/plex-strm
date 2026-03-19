@@ -137,13 +137,18 @@ def _warm_cache(url, timeout=12):
     This triggers Zurg's RD API call so subsequent FFprobe requests
     hit the cached redirect and complete in <1s instead of ~10s.
     """
+    url_id = url.rsplit("/", 1)[-1] if "/" in url else url[-30:]
     try:
         import requests as _req
         resp = _req.get(url, headers={"Range": "bytes=0-0"},
                         timeout=timeout, stream=True, allow_redirects=True)
         resp.close()
-        return resp.status_code in (200, 206)
-    except Exception:
+        if resp.status_code in (200, 206):
+            return True
+        log.debug("Warm-up HTTP %d [%s]", resp.status_code, url_id)
+        return False
+    except Exception as e:
+        log.debug("Warm-up failed [%s]: %s", url_id, e)
         return False
 
 
@@ -232,7 +237,7 @@ def _parse_ffprobe(data):
     if "format_name" in fmt:
         container = fmt["format_name"].split(",")[0]
         # Normalize container names to match Plex conventions
-        container_map = {"matroska": "mkv", "mov,mp4,m4a,3gp,3g2,mj2": "mp4"}
+        container_map = {"matroska": "mkv", "mov": "mp4", "mov,mp4,m4a,3gp,3g2,mj2": "mp4"}
         meta["container"] = container_map.get(container, container)
 
     video_streams = []
@@ -269,8 +274,10 @@ def _parse_ffprobe(data):
     # Primary video stream for media_items fields
     if video_streams:
         video_stream = video_streams[0]
-        meta["width"] = video_stream.get("width", 1920)
-        meta["height"] = video_stream.get("height", 1080)
+        if "width" in video_stream:
+            meta["width"] = video_stream["width"]
+        if "height" in video_stream:
+            meta["height"] = video_stream["height"]
         meta["video_codec"] = _plex_codec(video_stream.get("codec_name", "h264"))
 
         dar = video_stream.get("display_aspect_ratio", "")
@@ -406,7 +413,7 @@ def update_media_item(db, media_item_id, meta):
     cur.close()
 
 
-def update_media_part(db, media_item_id, meta, strm_url=None):
+def update_media_part(db, media_item_id, meta, strm_url=None, part_id=None):
     """UPDATE media_parts with real file size and extra_data.
 
     Uses file size from FFprobe format output (no extra HEAD request needed).
@@ -414,15 +421,16 @@ def update_media_part(db, media_item_id, meta, strm_url=None):
     """
     ph = "%s" if db.is_pg else "?"
 
-    # Get the media_part ID
     cur = db.cursor()
-    db.execute(cur, f"SELECT id, file FROM media_parts WHERE media_item_id = {ph} LIMIT 1",
-               (media_item_id,))
-    row = cur.fetchone()
-    if not row:
-        cur.close()
-        return
-    part_id = row[0]
+    if part_id is None:
+        # Fallback: look up the part ID (legacy callers)
+        db.execute(cur, f"SELECT id, file FROM media_parts WHERE media_item_id = {ph} LIMIT 1",
+                   (media_item_id,))
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            return
+        part_id = row[0]
 
     # Use file size from FFprobe (already parsed from format.size)
     real_size = meta.get("size")
@@ -482,7 +490,7 @@ def update_media_part(db, media_item_id, meta, strm_url=None):
     cur.close()
 
 
-def create_media_streams(db, media_item_id, meta):
+def create_media_streams(db, media_item_id, meta, part_id=None):
     """Insert ALL video, audio, and subtitle stream entries from ffprobe data.
 
     Writes every stream with correct codec, language, channels, bitrate,
@@ -491,16 +499,21 @@ def create_media_streams(db, media_item_id, meta):
     cur = db.cursor()
 
     ph = "%s" if db.is_pg else "?"
-    db.execute(cur, f"SELECT id FROM media_parts WHERE media_item_id = {ph} LIMIT 1",
-               (media_item_id,))
-    row = db.fetchone(cur)
-    if not row:
-        cur.close()
-        return
-    media_part_id = row["id"]
+    if part_id is None:
+        # Fallback: look up the part ID (legacy callers)
+        db.execute(cur, f"SELECT id FROM media_parts WHERE media_item_id = {ph} LIMIT 1",
+                   (media_item_id,))
+        row = db.fetchone(cur)
+        if not row:
+            cur.close()
+            return
+        media_part_id = row["id"]
+    else:
+        media_part_id = part_id
 
-    db.execute(cur, f"DELETE FROM media_streams WHERE media_item_id = {ph}",
-               (media_item_id,))
+    # Only delete streams for this specific part, not the entire media item
+    db.execute(cur, f"DELETE FROM media_streams WHERE media_part_id = {ph}",
+               (media_part_id,))
 
     now = int(time.time())
     idx_col = db.q("index")

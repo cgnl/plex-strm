@@ -91,11 +91,25 @@ log = logging.getLogger("strm-proxy")
 
 app = Flask(__name__)
 
-# Shared HTTP session for upstream calls.
+# Per-thread HTTP sessions to avoid thread-safety issues with requests.Session.
 # Disable environment proxy auto-detection to avoid macOS CoreFoundation
 # proxy lookup (_scproxy) in forked worker processes.
-HTTP = requests.Session()
-HTTP.trust_env = False
+_http_local = threading.local()
+
+
+class _ThreadLocalSession:
+    """Proxy that delegates to a per-thread requests.Session."""
+
+    def __getattr__(self, name):
+        if not hasattr(_http_local, "session"):
+            s = requests.Session()
+            s.trust_env = False
+            _http_local.session = s
+        return getattr(_http_local.session, name)
+
+
+HTTP = _ThreadLocalSession()
+
 
 # ---------------------------------------------------------------------------
 # State
