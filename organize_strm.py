@@ -281,6 +281,7 @@ def pg_query(sql: str, timeout: int = 120) -> str:
     try:
         conn = _get_pg_conn()
         cur = conn.cursor()
+        cur.execute(f"SET statement_timeout = '{timeout}s'")
         cur.execute(sql)
         rows = cur.fetchall()
         cur.close()
@@ -297,10 +298,16 @@ def pg_query(sql: str, timeout: int = 120) -> str:
 def _get_pg_conn():
     """Get a psycopg2 connection to the Plex DB."""
     import psycopg2
+    host = os.environ.get("PLEX_PG_HOST", "localhost")
+    port = int(os.environ.get("PLEX_PG_PORT", "5432"))
+    database = os.environ.get("PLEX_PG_DATABASE", "plex")
+    user = os.environ.get("PLEX_PG_USER", "plex")
+    password = os.environ.get("PLEX_PG_PASSWORD", "plex")
+    schema = os.environ.get("PLEX_PG_SCHEMA", "plex")
     return psycopg2.connect(
-        host="localhost", port=5432, database="plex",
-        user="plex", password="plex",
-        options="-c search_path=plex",
+        host=host, port=port, database=database,
+        user=user, password=password,
+        options=f"-c search_path={schema}",
     )
 
 
@@ -646,12 +653,7 @@ def pg_update_directory_paths(renames: dict):
     if not renames:
         return
     try:
-        import psycopg2
-        conn = psycopg2.connect(
-            host="localhost", port=5432, database="plex",
-            user="plex", password="plex",
-            options="-c search_path=plex",
-        )
+        conn = _get_pg_conn()
         lib_ids = list(get_library_id_map().values())
         cur = conn.cursor()
         updated = 0

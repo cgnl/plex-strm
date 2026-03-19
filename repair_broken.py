@@ -76,23 +76,39 @@ def pg_query(sql):
             log.error("SQLite query failed: %s", e)
             return ""
     try:
-        result = subprocess.run(
-            [PSQL] + PG_CONN + ["-t", "-A", "-c", sql],
-            capture_output=True, text=True, timeout=30,
+        import psycopg2
+        conn = psycopg2.connect(
+            host=os.environ.get("PLEX_PG_HOST", "localhost"),
+            port=int(os.environ.get("PLEX_PG_PORT", "5432")),
+            database=os.environ.get("PLEX_PG_DATABASE", "plex"),
+            user=os.environ.get("PLEX_PG_USER", "plex"),
+            password=os.environ.get("PLEX_PG_PASSWORD", "plex"),
+            options=f"-c search_path={PG_SCHEMA}",
         )
-        return result.stdout.strip()
+        cur = conn.cursor()
+        cur.execute(sql)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        out = []
+        for row in rows:
+            out.append("|".join("" if v is None else str(v) for v in row))
+        return "\n".join(out)
     except Exception as e:
         log.error("PostgreSQL query failed: %s", e)
         return ""
 
 
-def pg_execute(sql):
+def pg_execute(sql, params=None):
     """Execute DB statement, return output with affected-row count."""
     if PLEX_DB_MODE == "sqlite":
         try:
             conn = sqlite3.connect(PLEX_SQLITE_PATH)
             cur = conn.cursor()
-            cur.execute(sql)
+            if params:
+                cur.execute(sql, params)
+            else:
+                cur.execute(sql)
             count = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
             conn.commit()
             cur.close()
@@ -102,11 +118,25 @@ def pg_execute(sql):
             log.error("SQLite execute failed: %s", e)
             return ""
     try:
-        result = subprocess.run(
-            [PSQL] + PG_CONN + ["-c", sql],
-            capture_output=True, text=True, timeout=30,
+        import psycopg2
+        conn = psycopg2.connect(
+            host=os.environ.get("PLEX_PG_HOST", "localhost"),
+            port=int(os.environ.get("PLEX_PG_PORT", "5432")),
+            database=os.environ.get("PLEX_PG_DATABASE", "plex"),
+            user=os.environ.get("PLEX_PG_USER", "plex"),
+            password=os.environ.get("PLEX_PG_PASSWORD", "plex"),
+            options=f"-c search_path={PG_SCHEMA}",
         )
-        return result.stdout.strip()
+        cur = conn.cursor()
+        if params:
+            cur.execute(sql, params)
+        else:
+            cur.execute(sql)
+        count = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+        conn.commit()
+        cur.close()
+        conn.close()
+        return "UPDATE %d" % count
     except Exception as e:
         log.error("PostgreSQL execute failed: %s", e)
         return ""
@@ -229,17 +259,35 @@ def reset_rd_ids_to_zero(rd_ids):
     """Reset media_analysis_version to 0 for given RD IDs."""
     if not rd_ids:
         return 0
-    sql = f"""
-        UPDATE {t('media_items')} SET media_analysis_version = 0
-        WHERE media_analysis_version = -1
-          AND id IN (
-            SELECT mi.id FROM {t('media_items')} mi
-            JOIN {t('media_parts')} mp ON mp.media_item_id = mi.id
-            WHERE mi.media_analysis_version = -1
-              AND ({' OR '.join("mp.file LIKE '%%/strm/%s'" % rid for rid in rd_ids)})
-          )
-    """
-    result = pg_execute(sql)
+    # Use parameterized LIKE patterns to prevent SQL injection
+    if PLEX_DB_MODE == "sqlite":
+        like_clauses = " OR ".join("mp.file LIKE ?" for _ in rd_ids)
+        params = [f"%/strm/{rid}" for rid in rd_ids]
+        sql = f"""
+            UPDATE {t('media_items')} SET media_analysis_version = 0
+            WHERE media_analysis_version = -1
+              AND id IN (
+                SELECT mi.id FROM {t('media_items')} mi
+                JOIN {t('media_parts')} mp ON mp.media_item_id = mi.id
+                WHERE mi.media_analysis_version = -1
+                  AND ({like_clauses})
+              )
+        """
+        result = pg_execute(sql, params)
+    else:
+        like_clauses = " OR ".join("mp.file LIKE %s" for _ in rd_ids)
+        params = [f"%/strm/{rid}" for rid in rd_ids]
+        sql = f"""
+            UPDATE {t('media_items')} SET media_analysis_version = 0
+            WHERE media_analysis_version = -1
+              AND id IN (
+                SELECT mi.id FROM {t('media_items')} mi
+                JOIN {t('media_parts')} mp ON mp.media_item_id = mi.id
+                WHERE mi.media_analysis_version = -1
+                  AND ({like_clauses})
+              )
+        """
+        result = pg_execute(sql, params)
     # Extract count from "UPDATE N"
     if result and 'UPDATE' in result:
         try:

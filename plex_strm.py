@@ -554,15 +554,19 @@ def cmd_update(args):
             if transient_failed:
                 log.info("%d items failed transiently — will be retried next run", transient_failed)
 
-                fail_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffprobe_failures.log")
-                with open(fail_log, "w", encoding="utf-8") as f:
-                    f.write(f"# FFprobe failures: {len(failed_items)} items\n")
-                    f.write(f"# Generated: {datetime.now().isoformat()}\n")
-                    f.write(f"# Total: {analyzed + failed}, OK: {analyzed}, Failed: {failed}\n\n")
-                    for mid, url in failed_items:
-                        url_id = url.rsplit("/", 1)[-1] if "/" in url else url[-30:]
-                        f.write(f"{mid}\t{url_id}\t{url}\n")
-                log.info("Failed items written to %s", fail_log)
+            if failed_items:
+                try:
+                    fail_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffprobe_failures.log")
+                    with open(fail_log, "w", encoding="utf-8") as f:
+                        f.write(f"# FFprobe failures: {len(failed_items)} items\n")
+                        f.write(f"# Generated: {datetime.now().isoformat()}\n")
+                        f.write(f"# Total: {analyzed + failed}, OK: {analyzed}, Failed: {failed}\n\n")
+                        for mid, url in failed_items:
+                            url_id = url.rsplit("/", 1)[-1] if "/" in url else url[-30:]
+                            f.write(f"{mid}\t{url_id}\t{url}\n")
+                    log.info("Failed items written to %s", fail_log)
+                except Exception as e:
+                    log.warning("Could not write ffprobe_failures.log: %s", e)
 
             # Trigger Plex native analyze so internal caches are updated
             if analyzed_mids:

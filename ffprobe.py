@@ -402,15 +402,17 @@ def update_media_item(db, media_item_id, meta):
         return
 
     cur = db.cursor()
-    if db.is_pg:
-        sets = ", ".join(f"{k} = %s" for k in updatable)
-        vals = list(updatable.values()) + [media_item_id]
-        db.execute(cur, f"UPDATE media_items SET {sets} WHERE id = %s", tuple(vals))
-    else:
-        sets = ", ".join(f"{k} = ?" for k in updatable)
-        vals = list(updatable.values()) + [media_item_id]
-        db.execute(cur, f"UPDATE media_items SET {sets} WHERE id = ?", tuple(vals))
-    cur.close()
+    try:
+        if db.is_pg:
+            sets = ", ".join(f"{k} = %s" for k in updatable)
+            vals = list(updatable.values()) + [media_item_id]
+            db.execute(cur, f"UPDATE media_items SET {sets} WHERE id = %s", tuple(vals))
+        else:
+            sets = ", ".join(f"{k} = ?" for k in updatable)
+            vals = list(updatable.values()) + [media_item_id]
+            db.execute(cur, f"UPDATE media_items SET {sets} WHERE id = ?", tuple(vals))
+    finally:
+        cur.close()
 
 
 def update_media_part(db, media_item_id, meta, strm_url=None, part_id=None):
@@ -422,72 +424,72 @@ def update_media_part(db, media_item_id, meta, strm_url=None, part_id=None):
     ph = "%s" if db.is_pg else "?"
 
     cur = db.cursor()
-    if part_id is None:
-        # Fallback: look up the part ID (legacy callers)
-        db.execute(cur, f"SELECT id, file FROM media_parts WHERE media_item_id = {ph} LIMIT 1",
-                   (media_item_id,))
-        row = cur.fetchone()
-        if not row:
-            cur.close()
-            return
-        part_id = row[0]
+    try:
+        if part_id is None:
+            # Fallback: look up the part ID (legacy callers)
+            db.execute(cur, f"SELECT id, file FROM media_parts WHERE media_item_id = {ph} LIMIT 1",
+                       (media_item_id,))
+            row = cur.fetchone()
+            if not row:
+                return
+            part_id = row[0]
 
-    # Use file size from FFprobe (already parsed from format.size)
-    real_size = meta.get("size")
+        # Use file size from FFprobe (already parsed from format.size)
+        real_size = meta.get("size")
 
-    # Build extra_data for media_parts
-    container = meta.get("container", "mkv")
-    video_profile = meta.get("video_profile", "")
-    audio_profile = meta.get("audio_profile", "")
-    extra = {}
-    url_parts = []
+        # Build extra_data for media_parts
+        container = meta.get("container", "mkv")
+        video_profile = meta.get("video_profile", "")
+        audio_profile = meta.get("audio_profile", "")
+        extra = {}
+        url_parts = []
 
-    if audio_profile:
-        extra["ma:audioProfile"] = audio_profile
-        url_parts.append(f"ma%3AaudioProfile={audio_profile}")
+        if audio_profile:
+            extra["ma:audioProfile"] = audio_profile
+            url_parts.append(f"ma%3AaudioProfile={audio_profile}")
 
-    extra["ma:container"] = container
-    url_parts.append(f"ma%3Acontainer={container}")
+        extra["ma:container"] = container
+        url_parts.append(f"ma%3Acontainer={container}")
 
-    if meta.get("_has_thumbnail"):
-        extra["ma:hasThumbnail"] = "1"
-        url_parts.append("ma%3AhasThumbnail=1")
+        if meta.get("_has_thumbnail"):
+            extra["ma:hasThumbnail"] = "1"
+            url_parts.append("ma%3AhasThumbnail=1")
 
-    if video_profile:
-        extra["ma:videoProfile"] = video_profile
-        url_parts.append(f"ma%3AvideoProfile={video_profile}")
+        if video_profile:
+            extra["ma:videoProfile"] = video_profile
+            url_parts.append(f"ma%3AvideoProfile={video_profile}")
 
-    # Chapters — always include (Plex expects it, even if empty)
-    chapters = meta.get("_chapters")
-    if chapters:
-        ch_json = json.dumps({"Chapters": {"Chapter": chapters}})
-    else:
-        ch_json = json.dumps({"Chapters": {}})
-    extra["pv:chapters"] = ch_json
-    from urllib.parse import quote
-    url_parts.append(f"pv%3Achapters={quote(ch_json, safe='')}")
+        # Chapters — always include (Plex expects it, even if empty)
+        chapters = meta.get("_chapters")
+        if chapters:
+            ch_json = json.dumps({"Chapters": {"Chapter": chapters}})
+        else:
+            ch_json = json.dumps({"Chapters": {}})
+        extra["pv:chapters"] = ch_json
+        from urllib.parse import quote
+        url_parts.append(f"pv%3Achapters={quote(ch_json, safe='')}")
 
-    if url_parts:
-        extra["url"] = "&".join(url_parts)
+        if url_parts:
+            extra["url"] = "&".join(url_parts)
 
-    extra_data = json.dumps(extra) if extra else None
+        extra_data = json.dumps(extra) if extra else None
 
-    # Update media_parts
-    updates = {}
-    if real_size and real_size > 1000:
-        updates["size"] = real_size
-    duration = meta.get("duration")
-    if duration and duration > 0:
-        updates["duration"] = duration
-    if extra_data:
-        updates["extra_data"] = extra_data
+        # Update media_parts
+        updates = {}
+        if real_size and real_size > 1000:
+            updates["size"] = real_size
+        duration = meta.get("duration")
+        if duration and duration > 0:
+            updates["duration"] = duration
+        if extra_data:
+            updates["extra_data"] = extra_data
 
-    if updates:
-        sets = ", ".join(f"{k} = {ph}" for k in updates)
-        vals = list(updates.values()) + [part_id]
-        db.execute(cur, f"UPDATE media_parts SET {sets} WHERE id = {ph}", tuple(vals))
-
-    cur.close()
+        if updates:
+            sets = ", ".join(f"{k} = {ph}" for k in updates)
+            vals = list(updates.values()) + [part_id]
+            db.execute(cur, f"UPDATE media_parts SET {sets} WHERE id = {ph}", tuple(vals))
+    finally:
+        cur.close()
 
 
 def create_media_streams(db, media_item_id, meta, part_id=None):
@@ -497,245 +499,238 @@ def create_media_streams(db, media_item_id, meta, part_id=None):
     default/forced flags — no hardcoded values.
     """
     cur = db.cursor()
+    try:
+        ph = "%s" if db.is_pg else "?"
+        if part_id is None:
+            # Fallback: look up the part ID (legacy callers)
+            db.execute(cur, f"SELECT id FROM media_parts WHERE media_item_id = {ph} LIMIT 1",
+                       (media_item_id,))
+            row = db.fetchone(cur)
+            if not row:
+                return
+            media_part_id = row["id"]
+        else:
+            media_part_id = part_id
 
-    ph = "%s" if db.is_pg else "?"
-    if part_id is None:
-        # Fallback: look up the part ID (legacy callers)
-        db.execute(cur, f"SELECT id FROM media_parts WHERE media_item_id = {ph} LIMIT 1",
-                   (media_item_id,))
-        row = db.fetchone(cur)
-        if not row:
-            cur.close()
-            return
-        media_part_id = row["id"]
-    else:
-        media_part_id = part_id
+        # Only delete streams for this specific part, not the entire media item
+        db.execute(cur, f"DELETE FROM media_streams WHERE media_part_id = {ph}",
+                   (media_part_id,))
 
-    # Only delete streams for this specific part, not the entire media item
-    db.execute(cur, f"DELETE FROM media_streams WHERE media_part_id = {ph}",
-               (media_part_id,))
+        now = int(time.time())
+        idx_col = db.q("index")
+        dflt_col = db.q("default")
+        stream_index = 0
 
-    now = int(time.time())
-    idx_col = db.q("index")
-    dflt_col = db.q("default")
-    stream_index = 0
+        # ── Video streams ────────────────────────────────────────────
+        for vs in meta.get("_video_streams", []):
+            codec = _plex_codec(vs.get("codec_name") or "")
+            if not codec:
+                continue
 
-    # ── Video streams ────────────────────────────────────────────
-    for vs in meta.get("_video_streams", []):
-        codec = _plex_codec(vs.get("codec_name") or "")
-        if not codec:
-            continue
+            lang = _plex_lang((vs.get("tags") or {}).get("language"))
+            w = vs.get("width")
+            h = vs.get("height")
+            coded_w = vs.get("coded_width")
+            coded_h = vs.get("coded_height")
+            bitrate = vs.get("bit_rate")
+            if bitrate:
+                bitrate = int(bitrate)
+            elif meta.get("bitrate"):
+                bitrate = meta["bitrate"]
 
-        lang = _plex_lang((vs.get("tags") or {}).get("language"))
-        w = vs.get("width")
-        h = vs.get("height")
-        coded_w = vs.get("coded_width")
-        coded_h = vs.get("coded_height")
-        bitrate = vs.get("bit_rate")
-        if bitrate:
-            bitrate = int(bitrate)
-        elif meta.get("bitrate"):
-            bitrate = meta["bitrate"]
+            disp = vs.get("disposition", {})
+            is_default = 1 if disp.get("default") else 0
+            is_forced = 1 if disp.get("forced") else 0
 
-        disp = vs.get("disposition", {})
-        is_default = 1 if disp.get("default") else 0
-        is_forced = 1 if disp.get("forced") else 0
+            extra_parts = {}
+            if h:
+                extra_parts["ma:height"] = str(h)
+            if w:
+                extra_parts["ma:width"] = str(w)
+            if coded_h:
+                extra_parts["ma:codedHeight"] = str(coded_h)
+            if coded_w:
+                extra_parts["ma:codedWidth"] = str(coded_w)
 
-        extra_parts = {}
-        if h:
-            extra_parts["ma:height"] = str(h)
-        if w:
-            extra_parts["ma:width"] = str(w)
-        if coded_h:
-            extra_parts["ma:codedHeight"] = str(coded_h)
-        if coded_w:
-            extra_parts["ma:codedWidth"] = str(coded_w)
-
-        profile = (vs.get("profile") or "").lower()
-        vs_bit_depth = vs.get("bits_per_raw_sample")
-        plex_profile = None
-        if "baseline" in profile:
-            plex_profile = "baseline"
-        elif "high" in profile and "10" in profile:
-            plex_profile = "high 10"
-        elif "high" in profile:
-            plex_profile = "high"
-        elif "main" in profile and "10" in profile:
-            plex_profile = "main 10"
-        elif "main" in profile:
-            if vs_bit_depth and int(vs_bit_depth) > 8:
+            profile = (vs.get("profile") or "").lower()
+            vs_bit_depth = vs.get("bits_per_raw_sample")
+            plex_profile = None
+            if "baseline" in profile:
+                plex_profile = "baseline"
+            elif "high" in profile and "10" in profile:
+                plex_profile = "high 10"
+            elif "high" in profile:
+                plex_profile = "high"
+            elif "main" in profile and "10" in profile:
                 plex_profile = "main 10"
-            else:
-                plex_profile = "main"
-        elif profile:
-            plex_profile = profile
-        if plex_profile:
-            extra_parts["ma:profile"] = plex_profile
-            # Note: Plex native analyzer only puts ma:profile in stream extra_data,
-            # NOT ma:videoProfile (that goes in media_items.extra_data only)
+            elif "main" in profile:
+                if vs_bit_depth and int(vs_bit_depth) > 8:
+                    plex_profile = "main 10"
+                else:
+                    plex_profile = "main"
+            elif profile:
+                plex_profile = profile
+            if plex_profile:
+                extra_parts["ma:profile"] = plex_profile
 
-        # Rich metadata matching Plex analyze
-        rfr = vs.get("r_frame_rate", "")
-        if "/" in rfr:
-            try:
-                n, d = rfr.split("/")
-                extra_parts["ma:frameRate"] = "{:.3f}".format(float(n) / float(d))
-            except (ValueError, ZeroDivisionError):
-                pass
+            # Rich metadata matching Plex analyze
+            rfr = vs.get("r_frame_rate", "")
+            if "/" in rfr:
+                try:
+                    n, d = rfr.split("/")
+                    extra_parts["ma:frameRate"] = "{:.3f}".format(float(n) / float(d))
+                except (ValueError, ZeroDivisionError):
+                    pass
 
-        level = vs.get("level")
-        if level is not None:
-            extra_parts["ma:level"] = str(level)
+            level = vs.get("level")
+            if level is not None:
+                extra_parts["ma:level"] = str(level)
 
-        refs = vs.get("refs")
-        if refs is not None:
-            extra_parts["ma:refFrames"] = str(refs)
+            refs = vs.get("refs")
+            if refs is not None:
+                extra_parts["ma:refFrames"] = str(refs)
 
-        bits_per_raw = vs.get("bits_per_raw_sample")
-        if bits_per_raw:
-            extra_parts["ma:bitDepth"] = str(bits_per_raw)
+            bits_per_raw = vs.get("bits_per_raw_sample")
+            if bits_per_raw:
+                extra_parts["ma:bitDepth"] = str(bits_per_raw)
 
-        pix_fmt = vs.get("pix_fmt", "")
-        if "420" in pix_fmt:
-            extra_parts["ma:chromaSubsampling"] = "4:2:0"
-        elif "422" in pix_fmt:
-            extra_parts["ma:chromaSubsampling"] = "4:2:2"
-        elif "444" in pix_fmt:
-            extra_parts["ma:chromaSubsampling"] = "4:4:4"
+            pix_fmt = vs.get("pix_fmt", "")
+            if "420" in pix_fmt:
+                extra_parts["ma:chromaSubsampling"] = "4:2:0"
+            elif "422" in pix_fmt:
+                extra_parts["ma:chromaSubsampling"] = "4:2:2"
+            elif "444" in pix_fmt:
+                extra_parts["ma:chromaSubsampling"] = "4:4:4"
 
-        chroma_loc = vs.get("chroma_location")
-        if chroma_loc:
-            extra_parts["ma:chromaLocation"] = chroma_loc
+            chroma_loc = vs.get("chroma_location")
+            if chroma_loc:
+                extra_parts["ma:chromaLocation"] = chroma_loc
 
-        field_order = vs.get("field_order", "")
-        if field_order in ("progressive", ""):
-            extra_parts["ma:scanType"] = "progressive"
-        elif field_order != "unknown":
-            extra_parts["ma:scanType"] = "interlaced"
+            field_order = vs.get("field_order", "")
+            if field_order in ("progressive", ""):
+                extra_parts["ma:scanType"] = "progressive"
+            elif field_order != "unknown":
+                extra_parts["ma:scanType"] = "interlaced"
 
-        # Color metadata
-        color_primaries = vs.get("color_primaries")
-        if color_primaries and color_primaries != "unknown":
-            extra_parts["ma:colorPrimaries"] = color_primaries
-        color_range = vs.get("color_range")
-        if color_range and color_range != "unknown":
-            extra_parts["ma:colorRange"] = color_range
-        color_space = vs.get("color_space")
-        if color_space and color_space != "unknown":
-            extra_parts["ma:colorSpace"] = color_space
-        color_transfer = vs.get("color_transfer")
-        if color_transfer and color_transfer != "unknown":
-            extra_parts["ma:colorTrc"] = color_transfer
+            # Color metadata
+            color_primaries = vs.get("color_primaries")
+            if color_primaries and color_primaries != "unknown":
+                extra_parts["ma:colorPrimaries"] = color_primaries
+            color_range = vs.get("color_range")
+            if color_range and color_range != "unknown":
+                extra_parts["ma:colorRange"] = color_range
+            color_space = vs.get("color_space")
+            if color_space and color_space != "unknown":
+                extra_parts["ma:colorSpace"] = color_space
+            color_transfer = vs.get("color_transfer")
+            if color_transfer and color_transfer != "unknown":
+                extra_parts["ma:colorTrc"] = color_transfer
 
-        title = (vs.get("tags") or {}).get("title")
-        if title:
-            extra_parts["ma:title"] = title
+            title = (vs.get("tags") or {}).get("title")
+            if title:
+                extra_parts["ma:title"] = title
 
-        url_parts = [f"ma%3A{k.split(':')[1]}={v}" for k, v in extra_parts.items()]
-        if url_parts:
-            extra_parts["url"] = "&".join(url_parts)
-        extra_data = json.dumps(extra_parts) if extra_parts else None
+            url_parts = [f"ma%3A{k.split(':')[1]}={v}" for k, v in extra_parts.items()]
+            if url_parts:
+                extra_parts["url"] = "&".join(url_parts)
+            extra_data = json.dumps(extra_parts) if extra_parts else None
 
-        db.execute(cur, f"""
-            INSERT INTO media_streams
-            (stream_type_id, media_item_id, codec, language, created_at, updated_at,
-             {idx_col}, media_part_id, bitrate, channels, url_index,
-             {dflt_col}, forced, extra_data)
-            VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
-        """, (1, media_item_id, codec, lang, now, now, stream_index,
-              media_part_id, bitrate, None, None, is_default, is_forced, extra_data))
-        stream_index += 1
+            db.execute(cur, f"""
+                INSERT INTO media_streams
+                (stream_type_id, media_item_id, codec, language, created_at, updated_at,
+                 {idx_col}, media_part_id, bitrate, channels, url_index,
+                 {dflt_col}, forced, extra_data)
+                VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+            """, (1, media_item_id, codec, lang, now, now, stream_index,
+                  media_part_id, bitrate, None, None, is_default, is_forced, extra_data))
+            stream_index += 1
 
-    # ── Audio streams ────────────────────────────────────────────
-    for aus in meta.get("_audio_streams", []):
-        codec = _plex_codec(aus.get("codec_name") or "")
-        if not codec:
-            continue
+        # ── Audio streams ────────────────────────────────────────────
+        for aus in meta.get("_audio_streams", []):
+            codec = _plex_codec(aus.get("codec_name") or "")
+            if not codec:
+                continue
 
-        lang = _plex_lang((aus.get("tags") or {}).get("language"))
-        channels = aus.get("channels")
-        bitrate = aus.get("bit_rate")
-        if bitrate:
-            bitrate = int(bitrate)
+            lang = _plex_lang((aus.get("tags") or {}).get("language"))
+            channels = aus.get("channels")
+            bitrate = aus.get("bit_rate")
+            if bitrate:
+                bitrate = int(bitrate)
 
-        disp = aus.get("disposition", {})
-        is_default = 1 if disp.get("default") else 0
-        is_forced = 1 if disp.get("forced") else 0
+            disp = aus.get("disposition", {})
+            is_default = 1 if disp.get("default") else 0
+            is_forced = 1 if disp.get("forced") else 0
 
-        plex_profile = _normalize_audio_profile(aus.get("profile"))
+            plex_profile = _normalize_audio_profile(aus.get("profile"))
 
-        extra_parts = {}
-        if plex_profile:
-            extra_parts["ma:profile"] = plex_profile
-            # Note: Plex native analyzer only puts ma:profile in stream extra_data,
-            # NOT ma:audioProfile (that goes in media_items.extra_data only)
-        # Note: channels goes in DB column only, NOT in extra_data
-        # (Plex combines both into XML attributes — duplicates cause XML parse errors)
+            extra_parts = {}
+            if plex_profile:
+                extra_parts["ma:profile"] = plex_profile
 
-        # Rich audio metadata
-        channel_layout = aus.get("channel_layout")
-        if channel_layout:
-            extra_parts["ma:audioChannelLayout"] = channel_layout
+            # Rich audio metadata
+            channel_layout = aus.get("channel_layout")
+            if channel_layout:
+                extra_parts["ma:audioChannelLayout"] = channel_layout
 
-        sample_rate = aus.get("sample_rate")
-        if sample_rate:
-            extra_parts["ma:samplingRate"] = str(sample_rate)
+            sample_rate = aus.get("sample_rate")
+            if sample_rate:
+                extra_parts["ma:samplingRate"] = str(sample_rate)
 
-        bits_per_raw = aus.get("bits_per_raw_sample")
-        if bits_per_raw and bits_per_raw != "0":
-            extra_parts["ma:bitDepth"] = str(bits_per_raw)
+            bits_per_raw = aus.get("bits_per_raw_sample")
+            if bits_per_raw and bits_per_raw != "0":
+                extra_parts["ma:bitDepth"] = str(bits_per_raw)
 
-        title = (aus.get("tags") or {}).get("title")
-        if title:
-            extra_parts["ma:title"] = title
+            title = (aus.get("tags") or {}).get("title")
+            if title:
+                extra_parts["ma:title"] = title
 
-        url_parts = [f"ma%3A{k.split(':')[1]}={v}" for k, v in extra_parts.items()]
-        if url_parts:
-            extra_parts["url"] = "&".join(url_parts)
-        extra_data = json.dumps(extra_parts) if extra_parts else None
+            url_parts = [f"ma%3A{k.split(':')[1]}={v}" for k, v in extra_parts.items()]
+            if url_parts:
+                extra_parts["url"] = "&".join(url_parts)
+            extra_data = json.dumps(extra_parts) if extra_parts else None
 
-        db.execute(cur, f"""
-            INSERT INTO media_streams
-            (stream_type_id, media_item_id, codec, language, created_at, updated_at,
-             {idx_col}, media_part_id, bitrate, channels, url_index,
-             {dflt_col}, forced, extra_data)
-            VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
-        """, (2, media_item_id, codec, lang, now, now, stream_index,
-              media_part_id, bitrate, channels, None, is_default, is_forced, extra_data))
-        stream_index += 1
+            db.execute(cur, f"""
+                INSERT INTO media_streams
+                (stream_type_id, media_item_id, codec, language, created_at, updated_at,
+                 {idx_col}, media_part_id, bitrate, channels, url_index,
+                 {dflt_col}, forced, extra_data)
+                VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+            """, (2, media_item_id, codec, lang, now, now, stream_index,
+                  media_part_id, bitrate, channels, None, is_default, is_forced, extra_data))
+            stream_index += 1
 
-    # ── Subtitle streams ─────────────────────────────────────────
-    for ss in meta.get("_subtitle_streams", []):
-        codec = _plex_codec(ss.get("codec_name") or "")
-        if not codec:
-            continue
+        # ── Subtitle streams ─────────────────────────────────────────
+        for ss in meta.get("_subtitle_streams", []):
+            codec = _plex_codec(ss.get("codec_name") or "")
+            if not codec:
+                continue
 
-        lang = _plex_lang((ss.get("tags") or {}).get("language"))
-        title = (ss.get("tags") or {}).get("title")
+            lang = _plex_lang((ss.get("tags") or {}).get("language"))
+            title = (ss.get("tags") or {}).get("title")
 
-        disp = ss.get("disposition", {})
-        is_default = 1 if disp.get("default") else 0
-        is_forced = 1 if disp.get("forced") else 0
-        is_hearing_impaired = 1 if disp.get("hearing_impaired") else 0
+            disp = ss.get("disposition", {})
+            is_default = 1 if disp.get("default") else 0
+            is_forced = 1 if disp.get("forced") else 0
+            is_hearing_impaired = 1 if disp.get("hearing_impaired") else 0
 
-        extra_parts = {}
-        if is_hearing_impaired:
-            extra_parts["ma:hearingImpaired"] = "1"
-        if title:
-            extra_parts["ma:title"] = title
-        url_parts = [f"ma%3A{k.split(':')[1]}={v}" for k, v in extra_parts.items()]
-        if url_parts:
-            extra_parts["url"] = "&".join(url_parts)
-        extra_data = json.dumps(extra_parts) if extra_parts else None
+            extra_parts = {}
+            if is_hearing_impaired:
+                extra_parts["ma:hearingImpaired"] = "1"
+            if title:
+                extra_parts["ma:title"] = title
+            url_parts = [f"ma%3A{k.split(':')[1]}={v}" for k, v in extra_parts.items()]
+            if url_parts:
+                extra_parts["url"] = "&".join(url_parts)
+            extra_data = json.dumps(extra_parts) if extra_parts else None
 
-        db.execute(cur, f"""
-            INSERT INTO media_streams
-            (stream_type_id, media_item_id, codec, language, created_at, updated_at,
-             {idx_col}, media_part_id, bitrate, channels, url_index,
-             {dflt_col}, forced, extra_data)
-            VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
-        """, (3, media_item_id, codec, lang, now, now, stream_index,
-              media_part_id, None, None, None, is_default, is_forced, extra_data))
-        stream_index += 1
-
-    cur.close()
+            db.execute(cur, f"""
+                INSERT INTO media_streams
+                (stream_type_id, media_item_id, codec, language, created_at, updated_at,
+                 {idx_col}, media_part_id, bitrate, channels, url_index,
+                 {dflt_col}, forced, extra_data)
+                VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+            """, (3, media_item_id, codec, lang, now, now, stream_index,
+                  media_part_id, None, None, None, is_default, is_forced, extra_data))
+            stream_index += 1
+    finally:
+        cur.close()
