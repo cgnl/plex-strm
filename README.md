@@ -62,7 +62,8 @@ For a production-style setup with STRM fallback, use the bundled examples:
 - `examples/Caddyfile` — Plex + `/strm/*` split routing
 - `examples/docker-compose.strm-stack.yml` — runs `strm_proxy` + Caddy
 - `strm_proxy.py` — tries alternative STRM IDs on Zurg 5XX and triggers repair
-- `examples/strm_pipeline.sh` — automation wrapper (scan guard + optional timeout knobs)
+- `organize_strm.py` — symlink organizer with language-based library separation
+- `examples/strm_pipeline.sh` — full automation pipeline (`.env` config, scan guard, zurgtorrent sync, targeted refresh, summary logging)
 
 This way both Plex and Zurg share the same domain. Clients requesting `/strm/*` hit Zurg directly, everything else goes to Plex.
 
@@ -228,6 +229,7 @@ services:
 | `protect.py` | 4-layer trigger protection — install, drop, status, revert |
 | `strm_proxy.py` | STRM fallback proxy: alternate STRM IDs, optional local-file fallback, repair trigger |
 | `repair_broken.py` | One-by-one Zurg repair helper for broken STRM IDs (uses tiny ranged GET validation) |
+| `organize_strm.py` | Symlink organizer — sorts STRM files by language into separate Plex libraries |
 
 ## Install
 
@@ -357,13 +359,23 @@ plex-strm update --pg --reanalyze 2 --workers 8
 | `STREAM_CHUNK_SIZE` | Chunk size in bytes for proxied streams (default: `1048576` = 1MB) |
 | `ZURG_TIMEOUT` | Timeout in seconds for requests to Zurg (default: `45`) |
 
-### Pipeline example knobs
+### Pipeline
 
 | Variable | Description |
 |----------|-------------|
-| `ENABLE_SCAN_GUARD` | In `examples/strm_pipeline.sh`, skip run when STRM library scans are active (`1` default) |
-| `USE_TIMEOUTS` | Enable command timeouts in `examples/strm_pipeline.sh` (`0` default) |
+| `PLEX_TOKEN` | Plex authentication token |
+| `PLEX_URL` | Plex server URL (default: `http://localhost:32400`) |
+| `ZURG_HOST` | Zurg reverse proxy hostname (e.g. `strm.example.com`) |
+| `PLEX_HOST` | Plex reverse proxy hostname (e.g. `plex.example.com`) |
+| `ZURG_USER` | Zurg basic auth username |
+| `ZURG_PASS` | Zurg basic auth password |
+| `ENABLE_SCAN_GUARD` | Skip run when STRM library scans are active (`1` default) |
+| `MAX_SCAN_SKIP` | Max seconds to skip for active scan before running anyway (default `600`) |
+| `USE_TIMEOUTS` | Enable command timeouts (`0` default) |
 | `MAX_PLEX_STRM_TIME` | Timeout seconds for `plex_strm.py` when `USE_TIMEOUTS=1` (default `270`) |
+| `ZURG_REMOTE` | Remote Zurg data path for zurgtorrent rsync (e.g. `root@server:/opt/rd-stack/zurg/data/`) |
+| `ZURG_DATA_DIR` | Local zurgtorrent data directory (default: `$SCRIPT_DIR/data`) |
+| `PLEX_STRM_PY` | Path to plex_strm.py (default: `$SCRIPT_DIR/plex_strm.py`) |
 
 ### URL rewriting
 
@@ -385,7 +397,7 @@ FFprobe extracts **all** video, audio, and subtitle streams from each URL — no
 
 ### Smart retries
 
-FFprobe retries on timeouts and transient network errors, but **skips immediately** on server errors (403, 404, 5XX) since those indicate dead links. Failed items are written to `ffprobe_failures.log` for review.
+FFprobe retries on timeouts and transient network errors. Permanently dead links (403, 404) are marked with `media_analysis_version = -1` and skipped on subsequent runs. Transient failures (5XX, timeouts) are left at version 0 so they're retried next run. All failures are written to `ffprobe_failures.log` for review.
 
 ### Zurg repair integration
 
@@ -426,6 +438,53 @@ export RD_API_TOKEN=your-rd-api-token
 plex-strm update --pg --zurg-data-dir /path/to/zurg/data --cleanup-broken
 ```
 
+## Library organizer (organize_strm.py)
+
+Organizes Zurg's raw STRM output into separate Plex libraries by language, using symlinks:
+
+```
+strm/
+├── movies/          ← raw Zurg output (torrent-named folders)
+├── shows/           ← raw Zurg output
+├── movies-organized/ ← symlinks: Movie Name (Year)/movie.strm
+├── shows-organized/  ← symlinks: Show Name/Season XX/episode.strm
+├── movies-spanish/   ← Spanish audio movies (symlinks)
+└── shows-spanish/    ← Spanish audio shows (symlinks)
+```
+
+**How it works:**
+
+1. Parses torrent names using [PTT](https://github.com/dreulavelle/PTT) to extract title, year, season, episode
+2. Creates clean symlink structures (`Movie Name (Year)/file.strm`)
+3. Queries Plex's PostgreSQL database for audio stream languages (from FFprobe data)
+4. Items with English audio or not yet analyzed → `*-organized/` dirs
+5. Items with Spanish audio → `*-spanish/` dirs
+6. Multi-language items (both en+es) appear in both dirs
+7. Writes changed paths to a file for targeted Plex library refresh
+
+**Features:**
+
+- Deduplicates Plex metadata (merges duplicate show/movie entries per library)
+- Updates directory paths in Plex DB when folders are renamed
+- Handles Chinese/Korean/Japanese torrent names, release group prefixes, and other naming edge cases
+- Dynamic library ID lookup from Plex DB (no hardcoded IDs)
+
+**Requirements:**
+
+```bash
+pip install PTT psycopg2-binary
+```
+
+**Usage:**
+
+```bash
+# Standalone
+python3 organize_strm.py
+
+# As part of the pipeline (called by strm_pipeline.sh)
+ORGANIZE_CHANGED_PATHS_FILE=/tmp/changed.txt python3 organize_strm.py
+```
+
 ## Subtitle download
 
 When `--subtitles` is enabled, plex-strm searches OpenSubtitles.com for each processed media item:
@@ -458,39 +517,68 @@ Works with both SQLite triggers and PostgreSQL trigger functions.
 
 ## Automation
 
-Run periodically to process new `.strm` files:
+The full pipeline runs every 5 minutes and handles the complete chain:
+
+1. **Sync** zurgtorrent data from remote Zurg (for hash-based repair)
+2. **plex_strm.py** — inject new STRM URLs + FFprobe metadata into Plex DB
+3. **organize_strm.py** — create/update symlinks, separate by language
+4. **Plex scan** — targeted refresh on changed directories, full scan fallback
+
+See `examples/strm_pipeline.sh` for the full pipeline script.
+
+### Quick start
+
+1. Create a `.env` file with your credentials:
+
+```bash
+# .env
+PLEX_TOKEN=your-plex-token
+PLEX_URL=http://localhost:32400
+PLEX_PG_HOST=localhost
+PLEX_PG_PORT=5432
+PLEX_PG_DATABASE=plex
+PLEX_PG_USER=plex
+PLEX_PG_PASSWORD=plex
+PLEX_PG_SCHEMA=plex
+ZURG_USER=zurg
+ZURG_PASS=your-zurg-password
+ZURG_HOST=strm.yourdomain.com
+PLEX_HOST=plex.yourdomain.com
+OPENSUB_API_KEY=your-api-key
+OPENSUB_USER=your-username
+OPENSUB_PASS=your-password
+TMDB_API_KEY=your-tmdb-key
+RD_API_TOKEN=your-rd-token
+```
+
+2. Set up a cron job or LaunchAgent:
 
 ```bash
 # crontab
-*/5 * * * * /path/to/run-plex-strm.sh >> /path/to/plex-strm.log 2>&1
+*/5 * * * * /path/to/strm_pipeline.sh
 ```
 
-Example wrapper script:
-
-```bash
-#!/bin/bash
-export PLEX_PG_HOST=localhost
-export PLEX_PG_DATABASE=plex
-export PLEX_PG_USER=plex
-export PLEX_PG_PASSWORD=plex
-
-# Optional: OpenSubtitles
-export OPENSUB_API_KEY=your-api-key
-export OPENSUB_USER=your-username
-export OPENSUB_PASS=your-password
-export SUBTITLE_LANGS=en
-
-# Optional: RealDebrid (for --cleanup-broken)
-export RD_API_TOKEN=your-rd-api-token
-
-python3 /path/to/plex_strm.py --pg \
-  --library "My STRM Library" \
-  update --protect --subtitles --subtitle-mode missing \
-  --zurg-url http://user:pass@localhost:9091 \
-  --zurg-data-dir /path/to/zurg/data \
-  --cleanup-broken \
-  --base-url https://plex.example.com
+```xml
+<!-- macOS LaunchAgent: ~/Library/LaunchAgents/com.zurg.strm-pipeline.plist -->
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.zurg.strm-pipeline</string>
+    <key>ProgramArguments</key>
+    <array><string>/path/to/strm_pipeline.sh</string></array>
+    <key>StartInterval</key><integer>300</integer>
+    <key>RunAtLoad</key><true/>
+</dict>
+</plist>
 ```
+
+### Pipeline features
+
+- **Scan guard** — skips run while Plex is actively scanning STRM libraries (with configurable max skip time, default 10 min)
+- **Lockfile** — prevents concurrent runs
+- **Targeted refresh** — only refreshes Plex library paths that actually changed
+- **Dynamic library IDs** — looks up STRM library IDs via Plex API instead of hardcoding
+- **Summary logging** — logs URL count, analyzed, failed, and refresh count per run
+- **Log rotation** — rotates log file when it exceeds 1MB
 
 ## License
 
