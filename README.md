@@ -228,13 +228,16 @@ services:
 | `subtitles.py` | OpenSubtitles search/download/login, Plex DB registration |
 | `protect.py` | 4-layer trigger protection — install, drop, status, revert |
 | `strm_proxy.py` | STRM fallback proxy: alternate STRM IDs, optional local-file fallback, repair trigger |
-| `repair_broken.py` | One-by-one Zurg repair helper for broken STRM IDs (uses tiny ranged GET validation) |
+| `repair_broken.py` | One-by-one Zurg repair helper for broken STRM IDs (uses tiny ranged GET validation, psycopg2) |
 | `organize_strm.py` | Symlink organizer — sorts STRM files by language into separate Plex libraries |
 
 ## Install
 
 ```bash
 pip install -r requirements.txt
+
+# For organize_strm.py and repair_broken.py (PostgreSQL mode)
+pip install psycopg2-binary PTT
 ```
 
 Requires `ffprobe` (part of ffmpeg) on PATH.
@@ -307,7 +310,7 @@ plex-strm update --pg --reanalyze 2 --workers 8
 | Variable | Description |
 |----------|-------------|
 | `PLEX_DB` | Path to Plex SQLite database |
-| `PLEX_PG_HOST` | PostgreSQL host (enables PG mode) |
+| `PLEX_PG_HOST` | PostgreSQL host (enables PG mode). Used by all scripts: `plex_strm.py`, `organize_strm.py`, `repair_broken.py` |
 | `PLEX_PG_PORT` | PostgreSQL port (default: 5432) |
 | `PLEX_PG_DATABASE` | PostgreSQL database (default: plex) |
 | `PLEX_PG_USER` | PostgreSQL user (default: plex) |
