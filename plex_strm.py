@@ -9,6 +9,7 @@ Supports both SQLite and PostgreSQL (via plex-postgresql) backends.
 
 import argparse
 import fcntl
+import json
 import logging
 import os
 import sys
@@ -26,6 +27,40 @@ from zurg import (build_zurgtorrent_index, extract_rd_id_from_url,
                   is_server_error_url, cleanup_broken_torrents)
 
 log = logging.getLogger("plex-strm")
+
+# ── Dead hash cache: persist known-dead Zurg hashes across runs ──────────
+DEAD_HASH_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dead_hashes.json")
+
+
+def _load_dead_hashes():
+    """Load known-dead Zurg URL hashes from cache file."""
+    try:
+        with open(DEAD_HASH_CACHE, "r") as f:
+            data = json.load(f)
+        hashes = set(data.get("hashes", []))
+        if hashes:
+            log.info("Loaded %d known-dead hashes from cache", len(hashes))
+        return hashes
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+
+def _save_dead_hashes(hashes):
+    """Save known-dead Zurg URL hashes to cache file."""
+    try:
+        with open(DEAD_HASH_CACHE, "w") as f:
+            json.dump({"hashes": sorted(hashes), "updated": datetime.now().isoformat()}, f)
+        log.info("Saved %d dead hashes to cache", len(hashes))
+    except Exception as e:
+        log.warning("Could not save dead hash cache: %s", e)
+
+
+def _extract_url_hash(url):
+    """Extract Zurg hash from URL: /strm/HASH/filename.mkv -> HASH"""
+    import re
+    m = re.search(r'/strm/([A-Za-z0-9]+)(?:/|$)', url)
+    return m.group(1) if m else None
+
 
 # Default Plex URL for triggering analyze after DB writes
 PLEX_URL = os.environ.get("PLEX_URL", "http://localhost:32400")
@@ -135,9 +170,12 @@ def cmd_update(args):
         join, lib_where, lib_params = library_join(db, lib_ids, "mp")
         ph = "%s" if db.is_pg else "?"
         sql = (f"SELECT mp.id, mp.media_item_id, mp.file FROM media_parts mp"
+               f" JOIN media_items mi_f ON mi_f.id = mp.media_item_id"
                f"{join}"
                f" WHERE mp.file IS NOT NULL AND mp.file != ''"
-               f" AND LOWER(mp.file) LIKE {ph}{lib_where}")
+               f" AND LOWER(mp.file) LIKE {ph}"
+               f" AND mi_f.media_analysis_version != -1"
+               f"{lib_where}")
         params = ("%.strm",) + lib_params if lib_params else ("%.strm",)
         db.execute(cur, sql, params)
         strm_rows = db.fetchall(cur)
@@ -250,6 +288,46 @@ def cmd_update(args):
                          len(new_reanalyze), reanalyze_max)
                 url_mapping.update(new_reanalyze)
 
+        # ── Cleanup: mark items with empty/missing files as permanent failures ──
+        cur = db.cursor()
+        ph = "%s" if db.is_pg else "?"
+        join, lib_where, lib_params = library_join(db, lib_ids, "mp")
+        db.execute(cur,
+            f"SELECT mp.media_item_id FROM media_parts mp"
+            f" JOIN media_items mi_chk ON mi_chk.id = mp.media_item_id"
+            f"{join}"
+            f" WHERE (mp.file IS NULL OR mp.file = '')"
+            f" AND mi_chk.media_analysis_version = 0"
+            f"{lib_where}",
+            lib_params if lib_params else ())
+        empty_mids = [r["media_item_id"] for r in db.fetchall(cur)]
+        cur.close()
+        if empty_mids:
+            cur = db.cursor()
+            for mid in empty_mids:
+                db.execute(cur,
+                    f"UPDATE media_items SET media_analysis_version = -1 WHERE id = {ph}",
+                    (mid,))
+            db.commit()
+            cur.close()
+            log.info("Marked %d items with empty/missing files as permanently failed", len(empty_mids))
+
+        # ── Load dead hash cache: skip items known to be dead from prior runs ──
+        dead_hashes = _load_dead_hashes()
+        if dead_hashes and url_mapping:
+            skipped_dead = {}
+            surviving = {}
+            for mid, url in url_mapping.items():
+                h = _extract_url_hash(url)
+                if h and h in dead_hashes:
+                    skipped_dead[mid] = url
+                else:
+                    surviving[mid] = url
+            if skipped_dead:
+                log.info("Skipping %d items with known-dead hashes (%d unique hashes)",
+                         len(skipped_dead), len({_extract_url_hash(u) for u in skipped_dead.values()}))
+                url_mapping = surviving
+
         # FFprobe analysis
         if url_mapping:
             ffprobe_path = args.ffprobe or os.environ.get("FFPROBE_PATH", "ffprobe")
@@ -320,6 +398,7 @@ def cmd_update(args):
             permanent_fails = set() # mids with permanent (non-retryable) failures
             analyzed_mids = []
             all_warm_dead = []      # [(mid, url), ...] — accumulated dead torrents for repair
+            new_dead_hashes = set() # Zurg hashes confirmed dead this run
             t0 = time.time()
 
             # Process in passes: failures go back in queue for next pass
@@ -372,9 +451,23 @@ def cmd_update(args):
                             else:
                                 warm_fail.append((mid, url))
 
-                    # Dead torrents: accumulate for repair attempt after all batches
+                    # Dead torrents: mark immediately in DB + track for repair
                     if warm_dead:
                         all_warm_dead.extend(warm_dead)
+                        db.ensure_connected()
+                        cur = db.cursor()
+                        for mid, url in warm_dead:
+                            failed += 1
+                            failed_items.append((mid, url_mapping.get(mid, url)))
+                            permanent_fails.add(mid)
+                            db.execute(cur,
+                                f"UPDATE media_items SET media_analysis_version = -1 WHERE id = {ph}",
+                                (mid,))
+                            h = _extract_url_hash(url)
+                            if h:
+                                new_dead_hashes.add(h)
+                        db.commit()
+                        cur.close()
 
                     # Phase 2: FFprobe warmed items (fast, ~0.5s each)
                     if warm_fail:
@@ -455,9 +548,11 @@ def cmd_update(args):
                     seen_dead.add(mid)
                     unique_dead.append((mid, url))
 
+            # Dead items were already marked -1 per-batch.
+            # Try repair-all once; recovered items get un-marked and analyzed.
             if unique_dead and zurg_url:
-                log.info("Dead torrent repair: %d items with 'No working version' — "
-                         "attempting Zurg repair-all before marking permanent...",
+                log.info("Dead torrent repair: %d items already marked -1, "
+                         "attempting Zurg repair-all to recover...",
                          len(unique_dead))
 
                 repair_ok = trigger_repair_all(zurg_url)
@@ -469,7 +564,6 @@ def cmd_update(args):
 
                     # Retry warm-up for all dead items
                     recovered = []
-                    still_dead = []
                     log.info("Dead torrent repair: retrying warm-up for %d items...",
                              len(unique_dead))
                     with ThreadPoolExecutor(max_workers=WARM_WORKERS) as executor:
@@ -485,10 +579,8 @@ def cmd_update(args):
                                 status = "transient"
                             if status == "ok":
                                 recovered.append((mid, url))
-                            else:
-                                still_dead.append((mid, url))
 
-                    # Recovered items: run FFprobe
+                    # Recovered items: undo -1, run FFprobe, analyze
                     repair_analyzed = 0
                     if recovered:
                         db.ensure_connected()
@@ -511,35 +603,17 @@ def cmd_update(args):
                                     repair_analyzed += 1
                                     analyzed += 1
                                     analyzed_mids.append(mid)
-                                else:
-                                    still_dead.append((mid, url))
+                                    # Undo the -1 and failed count
+                                    failed -= 1
+                                    failed_items = [(m, u) for m, u in failed_items if m != mid]
+                                    permanent_fails.discard(mid)
+                                    h = _extract_url_hash(url)
+                                    if h:
+                                        new_dead_hashes.discard(h)
                         db.commit()
 
-                    # Still dead → permanent failures
-                    for mid, url in still_dead:
-                        failed += 1
-                        failed_items.append((mid, url_mapping.get(mid, url)))
-                        permanent_fails.add(mid)
-
-                    log.info("Dead torrent repair done: %d/%d recovered, %d permanently dead",
-                             repair_analyzed, len(unique_dead), len(still_dead))
-                else:
-                    # Repair failed — mark all as permanent
-                    log.info("Dead torrent repair: repair-all failed, marking %d as permanent",
-                             len(unique_dead))
-                    for mid, url in unique_dead:
-                        failed += 1
-                        failed_items.append((mid, url_mapping.get(mid, url)))
-                        permanent_fails.add(mid)
-
-            elif unique_dead:
-                # No Zurg URL — can't repair, mark all as permanent
-                log.info("No Zurg URL configured — marking %d dead items as permanent",
-                         len(unique_dead))
-                for mid, url in unique_dead:
-                    failed += 1
-                    failed_items.append((mid, url_mapping.get(mid, url)))
-                    permanent_fails.add(mid)
+                    log.info("Dead torrent repair done: %d/%d recovered",
+                             repair_analyzed, len(unique_dead))
 
             elapsed = time.time() - t0
             log.info("FFprobe done: %d analyzed, %d failed (%.1fs, %d passes)",
@@ -660,6 +734,11 @@ def cmd_update(args):
                              marked)
             if transient_failed:
                 log.info("%d items failed transiently — will be retried next run", transient_failed)
+
+            # Save dead hash cache (merge with existing)
+            if new_dead_hashes:
+                merged = dead_hashes | new_dead_hashes
+                _save_dead_hashes(merged)
 
             if failed_items:
                 try:
