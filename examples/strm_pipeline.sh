@@ -59,6 +59,8 @@ fi
 
 export FFPROBE_WORKERS=4
 export FFPROBE_TIMEOUT=30
+export SUBTITLE_LANGS=en
+export SUBTITLE_DIR="${SCRIPT_DIR}/subtitles"
 
 # plex_strm.py location (adjust for your setup)
 PLEX_STRM_PY="${PLEX_STRM_PY:-$SCRIPT_DIR/plex_strm.py}"

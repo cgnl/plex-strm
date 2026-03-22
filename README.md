@@ -230,6 +230,7 @@ services:
 | `strm_proxy.py` | STRM fallback proxy: alternate STRM IDs, optional local-file fallback, repair trigger |
 | `repair_broken.py` | One-by-one Zurg repair helper for broken STRM IDs (uses tiny ranged GET validation, psycopg2) |
 | `organize_strm.py` | Symlink organizer — sorts STRM files by language into separate Plex libraries |
+| `.dead_hashes.json` | Auto-generated cache of known-dead Zurg URL hashes (skipped on next run) |
 
 ## Install
 
@@ -398,30 +399,38 @@ FFprobe extracts **all** video, audio, and subtitle streams from each URL — no
 - Audio profile (LC/HE-AAC, DTS variants)
 - Subtitle hearing-impaired and title metadata
 
-### Smart retries
+### Smart retries and dead torrent handling
 
-FFprobe retries on timeouts and transient network errors. Permanently dead links (403, 404) are marked with `media_analysis_version = -1` and skipped on subsequent runs. Transient failures (5XX, timeouts) are left at version 0 so they're retried next run. All failures are written to `ffprobe_failures.log` for review.
+FFprobe retries on timeouts and transient network errors. Dead torrents are handled in multiple layers:
+
+1. **Per-batch marking** — During warm-up, items returning 502 "No working version" are immediately marked `media_analysis_version = -1` in the database. This survives crashes and kills — no progress is lost.
+2. **Dead hash cache** — Zurg URL hashes of dead items are persisted to `.dead_hashes.json`. On subsequent runs, these items are skipped entirely (no warm-up attempt), drastically reducing processing time.
+3. **Repair-before-permanent** — After all batches complete, a `Zurg repair-all` is triggered for dead items. Items that recover after repair are analyzed normally and removed from the dead hash cache.
+4. **Transient retries** — Timeouts and other transient failures (5XX without "No working version") are left at version 0 and retried next run.
+
+All failures are written to `ffprobe_failures.log` for review.
 
 ### Zurg repair integration
 
-When `--zurg-url` is set, plex-strm automatically triggers Zurg's repair process after FFprobe encounters server errors:
+When `--zurg-url` is set, plex-strm automatically triggers Zurg's repair process at two points:
 
-1. FFprobe runs on all items, collecting failures
-2. Failed URLs are mapped to torrent hashes (if `--zurg-data-dir` is set)
-3. Per-torrent repair requests are sent (`POST /manage/{hash}/repair`)
-4. Waits for repair to complete (scaled by number of affected torrents)
-5. Only retries items whose specific torrents were repaired
+**Pre-FFprobe repair** (for small batches ≤200 items):
+- Triggers per-torrent repair via `POST /manage/{hash}/repair` before FFprobe starts
+- Maps URLs to torrent hashes using `.zurgtorrent` files (if `--zurg-data-dir` is set)
 
-**Per-torrent repair** (with `--zurg-data-dir`):
-- Parses `.zurgtorrent` files to build an RD download ID → torrent hash index
-- Only repairs the specific broken torrents (not all 23K+), making repair much faster
-- Retries are targeted to items whose torrents were actually submitted for repair
+**Post-FFprobe repair** (for all failed items):
+1. Items that failed FFprobe are collected
+2. Zurg repair-all is triggered (`POST /torrents/repair`)
+3. Waits for repair to complete (scaled by number of affected torrents)
+4. Retries FFprobe on repaired items
 
-**Fallback** (without `--zurg-data-dir`):
-- Falls back to `POST /torrents/repair` (repair-all)
-- Retries all failed items after a global wait
+**Dead torrent repair** (for 502 "No working version" items):
+1. Dead items are marked -1 per-batch during warm-up
+2. After all batches, repair-all is triggered
+3. Dead items are retried — recovered items get analyzed and un-marked
+4. Still-dead items stay at -1 and their hashes are cached to skip next run
 
-This recovers torrents that RealDebrid temporarily couldn't serve.
+This recovers torrents that RealDebrid temporarily couldn't serve while efficiently skipping permanently dead ones.
 
 ### Broken torrent cleanup
 
