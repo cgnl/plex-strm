@@ -327,8 +327,8 @@ def cmd_update(args):
 
             # Batched warm+FFprobe: warm a batch, immediately FFprobe it.
             # Keeps RD API load manageable and ensures cache is hot for FFprobe.
-            WARM_BATCH = 100
-            WARM_WORKERS = 12
+            WARM_BATCH = 200
+            WARM_WORKERS = 32
             WARM_TIMEOUT = 30
 
             for pass_num in range(1 + retries):

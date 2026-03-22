@@ -137,12 +137,15 @@ def _warm_cache(url, timeout=12):
       - "ok"        — URL is reachable (2XX/206), ready for FFprobe
       - "permanent" — URL is permanently dead (Zurg says "No working version")
       - "transient" — temporary failure (timeout, 5XX server overload, etc.)
+
+    Uses a two-phase approach: short connect timeout (8s) to quickly detect
+    dead torrents (502 in ~5s), with the full read timeout for live streams.
     """
     url_id = url.rsplit("/", 1)[-1] if "/" in url else url[-30:]
     try:
         import requests as _req
         resp = _req.get(url, headers={"Range": "bytes=0-0"},
-                        timeout=timeout, stream=True, allow_redirects=True)
+                        timeout=(8, timeout), stream=True, allow_redirects=True)
         body = ""
         try:
             body = resp.text[:200] if resp.status_code >= 400 else ""
