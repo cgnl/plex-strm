@@ -352,6 +352,7 @@ def cmd_update(args):
                     # Phase 1: warm Zurg cache for this batch
                     warm_ok = {}
                     warm_fail = []
+                    warm_dead = []
                     with ThreadPoolExecutor(max_workers=WARM_WORKERS) as executor:
                         futs = {
                             executor.submit(_warm_cache, url, WARM_TIMEOUT): (mid, url)
@@ -360,13 +361,22 @@ def cmd_update(args):
                         for fut in as_completed(futs):
                             mid, url = futs[fut]
                             try:
-                                ok = fut.result()
+                                status = fut.result()
                             except Exception:
-                                ok = False
-                            if ok:
+                                status = "transient"
+                            if status == "ok":
                                 warm_ok[mid] = url
+                            elif status == "permanent":
+                                warm_dead.append((mid, url))
                             else:
                                 warm_fail.append((mid, url))
+
+                    # Dead torrents: mark as permanent failures immediately
+                    if warm_dead:
+                        for mid, url in warm_dead:
+                            failed += 1
+                            failed_items.append((mid, url_mapping.get(mid, url)))
+                            permanent_fails.add(mid)
 
                     # Phase 2: FFprobe warmed items (fast, ~0.5s each)
                     if warm_fail:
@@ -374,8 +384,8 @@ def cmd_update(args):
 
                     if not warm_ok:
                         if batch_idx % 5 == 0:
-                            log.info("Batch %d/%d: all %d warm-ups failed, queued for retry",
-                                     batch_idx + 1, len(batches), len(batch))
+                            log.info("Batch %d/%d: all %d warm-ups failed (%d dead), queued for retry",
+                                     batch_idx + 1, len(batches), len(batch), len(warm_dead))
                         continue
 
                     # Ensure DB connection is still alive after warm-up delay

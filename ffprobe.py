@@ -133,23 +133,33 @@ def _normalize_audio_profile(profile_str):
 def _warm_cache(url, timeout=12):
     """Pre-warm Zurg's RD redirect cache with a tiny range request.
 
-    Returns True if the URL is reachable (2XX/206), False otherwise.
-    This triggers Zurg's RD API call so subsequent FFprobe requests
-    hit the cached redirect and complete in <1s instead of ~10s.
+    Returns a status string:
+      - "ok"        — URL is reachable (2XX/206), ready for FFprobe
+      - "permanent" — URL is permanently dead (Zurg says "No working version")
+      - "transient" — temporary failure (timeout, 5XX server overload, etc.)
     """
     url_id = url.rsplit("/", 1)[-1] if "/" in url else url[-30:]
     try:
         import requests as _req
         resp = _req.get(url, headers={"Range": "bytes=0-0"},
                         timeout=timeout, stream=True, allow_redirects=True)
+        body = ""
+        try:
+            body = resp.text[:200] if resp.status_code >= 400 else ""
+        except Exception:
+            pass
         resp.close()
         if resp.status_code in (200, 206):
-            return True
+            return "ok"
+        # Zurg returns 502 with "No working version available" for dead torrents
+        if resp.status_code in (502, 503) and "no working version" in body.lower():
+            log.debug("Warm-up DEAD [%s]: %s", url_id, body.strip()[:80])
+            return "permanent"
         log.debug("Warm-up HTTP %d [%s]", resp.status_code, url_id)
-        return False
+        return "transient"
     except Exception as e:
         log.debug("Warm-up failed [%s]: %s", url_id, e)
-        return False
+        return "transient"
 
 
 def run_ffprobe(url, ffprobe_path="ffprobe", timeout=30, retries=0, rate_limiter=None):
