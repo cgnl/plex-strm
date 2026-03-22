@@ -55,7 +55,7 @@ def extract_rd_id_from_url(url):
     """
     if not url:
         return None
-    m = re.search(r'/strm/([A-Za-z0-9]+)$', url)
+    m = re.search(r'/strm/([A-Za-z0-9]+)(?:/|$)', url)
     return m.group(1) if m else None
 
 

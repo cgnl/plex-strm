@@ -319,6 +319,7 @@ def cmd_update(args):
             failed_items = []       # [(mid, url), ...] — all failures
             permanent_fails = set() # mids with permanent (non-retryable) failures
             analyzed_mids = []
+            all_warm_dead = []      # [(mid, url), ...] — accumulated dead torrents for repair
             t0 = time.time()
 
             # Process in passes: failures go back in queue for next pass
@@ -371,12 +372,9 @@ def cmd_update(args):
                             else:
                                 warm_fail.append((mid, url))
 
-                    # Dead torrents: mark as permanent failures immediately
+                    # Dead torrents: accumulate for repair attempt after all batches
                     if warm_dead:
-                        for mid, url in warm_dead:
-                            failed += 1
-                            failed_items.append((mid, url_mapping.get(mid, url)))
-                            permanent_fails.add(mid)
+                        all_warm_dead.extend(warm_dead)
 
                     # Phase 2: FFprobe warmed items (fast, ~0.5s each)
                     if warm_fail:
@@ -443,6 +441,105 @@ def cmd_update(args):
                 for mid, url in queue:
                     failed += 1
                     failed_items.append((mid, url_mapping.get(mid, url)))
+
+            # ================================================================
+            # Dead torrent repair: attempt Zurg repair before giving up
+            # Items with "No working version" get one repair attempt.
+            # Recovered items go through FFprobe; still-dead → permanent fail.
+            # ================================================================
+            # Deduplicate by mid (same item could appear in multiple batches)
+            seen_dead = set()
+            unique_dead = []
+            for mid, url in all_warm_dead:
+                if mid not in seen_dead:
+                    seen_dead.add(mid)
+                    unique_dead.append((mid, url))
+
+            if unique_dead and zurg_url:
+                log.info("Dead torrent repair: %d items with 'No working version' — "
+                         "attempting Zurg repair-all before marking permanent...",
+                         len(unique_dead))
+
+                repair_ok = trigger_repair_all(zurg_url)
+                if repair_ok:
+                    repair_wait = min(60, max(15, len(unique_dead) // 10))
+                    log.info("Dead torrent repair: waiting %ds for RealDebrid...",
+                             repair_wait)
+                    time.sleep(repair_wait)
+
+                    # Retry warm-up for all dead items
+                    recovered = []
+                    still_dead = []
+                    log.info("Dead torrent repair: retrying warm-up for %d items...",
+                             len(unique_dead))
+                    with ThreadPoolExecutor(max_workers=WARM_WORKERS) as executor:
+                        futs = {
+                            executor.submit(_warm_cache, url, WARM_TIMEOUT): (mid, url)
+                            for mid, url in unique_dead
+                        }
+                        for fut in as_completed(futs):
+                            mid, url = futs[fut]
+                            try:
+                                status = fut.result()
+                            except Exception:
+                                status = "transient"
+                            if status == "ok":
+                                recovered.append((mid, url))
+                            else:
+                                still_dead.append((mid, url))
+
+                    # Recovered items: run FFprobe
+                    repair_analyzed = 0
+                    if recovered:
+                        db.ensure_connected()
+                        with ThreadPoolExecutor(max_workers=workers) as executor:
+                            futs = {
+                                executor.submit(run_ffprobe, url, ffprobe_path, timeout, 0, None): (mid, url)
+                                for mid, url in recovered
+                            }
+                            for fut in as_completed(futs):
+                                mid, url = futs[fut]
+                                try:
+                                    meta, _retryable = fut.result()
+                                except Exception:
+                                    meta = None
+                                if meta:
+                                    pid = part_id_map.get(mid)
+                                    update_media_item(db, mid, dict(meta))
+                                    update_media_part(db, mid, dict(meta), part_id=pid)
+                                    create_media_streams(db, mid, dict(meta), part_id=pid)
+                                    repair_analyzed += 1
+                                    analyzed += 1
+                                    analyzed_mids.append(mid)
+                                else:
+                                    still_dead.append((mid, url))
+                        db.commit()
+
+                    # Still dead → permanent failures
+                    for mid, url in still_dead:
+                        failed += 1
+                        failed_items.append((mid, url_mapping.get(mid, url)))
+                        permanent_fails.add(mid)
+
+                    log.info("Dead torrent repair done: %d/%d recovered, %d permanently dead",
+                             repair_analyzed, len(unique_dead), len(still_dead))
+                else:
+                    # Repair failed — mark all as permanent
+                    log.info("Dead torrent repair: repair-all failed, marking %d as permanent",
+                             len(unique_dead))
+                    for mid, url in unique_dead:
+                        failed += 1
+                        failed_items.append((mid, url_mapping.get(mid, url)))
+                        permanent_fails.add(mid)
+
+            elif unique_dead:
+                # No Zurg URL — can't repair, mark all as permanent
+                log.info("No Zurg URL configured — marking %d dead items as permanent",
+                         len(unique_dead))
+                for mid, url in unique_dead:
+                    failed += 1
+                    failed_items.append((mid, url_mapping.get(mid, url)))
+                    permanent_fails.add(mid)
 
             elapsed = time.time() - t0
             log.info("FFprobe done: %d analyzed, %d failed (%.1fs, %d passes)",
